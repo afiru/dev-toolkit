@@ -1,0 +1,12 @@
+{
+  "name": "wp-builder",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "wp-builder": "./workspace-builder.mjs"
+  },
+  "engines": {
+    "node": ">=18 <19"
+  }
+}
