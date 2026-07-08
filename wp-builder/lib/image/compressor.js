@@ -39,3 +39,21 @@ export function compressImages(inputDir) {
         });
     });
 }
+// --- 追加してください ---
+export function compressSingleImage(filePath) {
+    if (!/\.(png|jpg|jpeg)$/i.test(filePath)) return;
+
+    const outputFile = filePath.replace(/\.(png|jpg|jpeg)$/i, '.webp');
+    if (fs.existsSync(outputFile)) return;
+
+    console.log(`Processing single image: ${path.basename(filePath)}...`);
+    const cmd = `"${cwebpPath}" -q 80 "${filePath}" -o "${outputFile}"`;
+
+    exec(cmd, (error, stdout, stderr) => {
+        if (error) {
+            console.error(`Error compressing ${filePath}: ${error.message}`);
+            return;
+        }
+        console.log(`Converted: ${path.basename(filePath)}`);
+    });
+}
