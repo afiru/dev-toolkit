@@ -1,17 +1,11 @@
 {
   "name": "wp-builder",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
   "bin": {
-    "wp-builder": "./workspace-builder.mjs"
+    "wp-builder": "./bin/cli.mjs"
   },
-  "scripts": {
-    "watch": "node workspace-builder.mjs --watch",
-    "scan": "node workspace-builder.mjs",
-    "security": "node workspace-builder.mjs --security-scan"
-  },
-  "engines": {
-    "node": ">=18 <19"
+  "dependencies": {
+    "commander": "^12.1.0"
   }
 }

@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, watch } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+  watch
+} from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
@@ -27,7 +35,9 @@ function walkFiles(dir, extensions, files = []) {
     return files;
   }
 
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+  for (const entry of readdirSync(dir, {
+      withFileTypes: true
+    })) {
     if (entry.isDirectory()) {
       if (!ignoredDirs.has(entry.name)) {
         walkFiles(path.join(dir, entry.name), extensions, files);
@@ -48,7 +58,9 @@ function ensureFile(filePath, contents) {
     return false;
   }
 
-  mkdirSync(path.dirname(filePath), { recursive: true });
+  mkdirSync(path.dirname(filePath), {
+    recursive: true
+  });
   writeFileSync(filePath, contents, 'utf8');
   console.log(`created ${toPosixPath(path.relative(root, filePath))}`);
   return true;
@@ -65,7 +77,16 @@ function phpStub(templatePart) {
 }
 
 function scssStub(name) {
-  return `.${name} {
+  return `/* ==========================================================================
+   use＆nameSpace
+   ========================================================================== */
+@use "../../Functions/mixin" as mi;
+
+/* ==========================================================================
+   LAYOUT
+   ========================================================================== */
+
+.${name} {
 }
 `;
 }
@@ -108,7 +129,9 @@ function ensureScssForwardIndex(scssPath) {
   const forwardLine = `@forward "${partialName}";`;
 
   if (!existsSync(indexPath)) {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, {
+      recursive: true
+    });
     writeFileSync(indexPath, `${forwardLine}\n`, 'utf8');
     console.log(`created ${toPosixPath(path.relative(root, indexPath))}`);
     return;
@@ -186,7 +209,10 @@ function scanColorUtilities(filePath) {
     const type = match[1];
     const hex = match[2].toUpperCase();
     const className = `${type}_${hex}`;
-    found.set(className, { type, hex });
+    found.set(className, {
+      type,
+      hex
+    });
   }
 
   if (found.size === 0) {
@@ -218,12 +244,15 @@ function scanColorUtilities(filePath) {
     return;
   }
 
-  mkdirSync(path.dirname(colorSPath), { recursive: true });
+  mkdirSync(path.dirname(colorSPath), {
+    recursive: true
+  });
   const prefix = current.trim().length > 0 ? `${current.replace(/\s*$/, '')}\n\n` : '';
   writeFileSync(colorSPath, `${prefix}${additions.join('\n\n')}\n`, 'utf8');
 
   console.log(`updated ${toPosixPath(path.relative(root, colorSPath))}`);
 }
+
 function guessEscapeFunction(fieldName, line) {
   const name = fieldName.toLowerCase();
 
@@ -311,6 +340,7 @@ function runSecurityScan() {
 
   console.log(`security scan complete: ${warningCount} warning(s), ${noticeCount} notice(s), ${phpFiles.length} PHP files`);
 }
+
 function scanWorkspace() {
   const phpFiles = walkFiles(root, new Set(['.php']));
   const scssFiles = walkFiles(root, new Set(['.scss']));
@@ -336,7 +366,9 @@ function watchWorkspace() {
   scanWorkspace();
   console.log('watching workspace for PHP and SCSS changes...');
 
-  watch(root, { recursive: true }, (_eventType, filename) => {
+  watch(root, {
+    recursive: true
+  }, (_eventType, filename) => {
     if (!filename) {
       return;
     }
