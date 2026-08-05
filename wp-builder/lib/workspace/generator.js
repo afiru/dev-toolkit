@@ -3,10 +3,14 @@ import path from 'node:path';
 import {
     toPosixPath
 } from '../utils/fs-helper.js';
+import {
+    getProjectContext
+} from './project-context.js';
 
-const root = process.cwd();
-const wpThemeRoot = path.join(root, 'public', 'wp-content', 'themes', 'WebPTemplatebyMarcat');
-const projectRoot = fs.existsSync(wpThemeRoot) ? wpThemeRoot : root;
+const {
+    projectRoot,
+    scssRoot
+} = getProjectContext();
 
 function scssStub(name) {
     return `/* ==========================================================================
@@ -25,7 +29,9 @@ function scssStub(name) {
 
 export function ensureTemplateFiles(templatePart) {
     const norm = toPosixPath(templatePart).replace(/\.php$/, '').replace(/^\/+/, '');
-    if (!norm.startsWith('include/layouts/')) return;
+    const isLayout = norm.startsWith('include/layouts/');
+    const isCommon = norm.startsWith('include/common/');
+    if (!isLayout && !isCommon) return;
 
     // 1. PHPファイルの作成
     const phpP = path.join(projectRoot, norm + '.php');
@@ -37,13 +43,16 @@ export function ensureTemplateFiles(templatePart) {
         console.log(`Created PHP: ${phpP}`);
     }
 
+    // include/common/ is PHP-only, matching the legacy workspace builder.
+    if (isCommon) return;
+
     // 2. SCSSファイルの作成 (インデックス計算を安全な方法に変更)
     const relativePath = norm.replace('include/layouts/', '');
     const parts = relativePath.split('/').filter(Boolean);
     const fileName = parts.pop(); // ファイル名を取得
 
     // レイアウトディレクトリ配下のパス構築
-    const scssP = path.join(projectRoot, 'scss', 'Layout', ...parts, `_${fileName}.scss`);
+    const scssP = path.join(scssRoot, 'Layout', ...parts, `_${fileName}.scss`);
 
     if (!fs.existsSync(scssP)) {
         fs.mkdirSync(path.dirname(scssP), {

@@ -1,0 +1,7 @@
+await import('./analyzer.test.mjs');
+await import('./html-context.test.mjs');
+await import('./byte-preservation.test.mjs');
+await import('./fix-plan.test.mjs');
+await import('./fix-apply.test.mjs');
+await import('./cli.test.mjs');
+await import('./temp-safety.test.mjs');

@@ -4,8 +4,13 @@ import {
     walkFiles,
     toPosixPath
 } from '../utils/fs-helper.js';
+import {
+    getProjectContext
+} from '../workspace/project-context.js';
 
-const root = process.cwd();
+const {
+    workspaceRoot: root
+} = getProjectContext();
 // 大文字小文字を無視(i)し、scf::get を広く拾う
 const scfP = /scf::get\s*\(\s*(['"])([^'"]+)\1\s*\)/gi;
 const escP = /(esc_html|esc_url|esc_attr|wp_kses_post|esc_textarea)\s*\([^)]*scf::get\s*\(/i;
@@ -19,6 +24,14 @@ function guess(f, line) {
     if (/(alt|aria|label|placeholder|title_attr|data_|id|class)/.test(n) || /=["'][^"']*scf::get/i.test(line)) return 'esc_attr';
     if (/(body|content|cnt|txt|html|wysiwyg|editor|detail|description|lead|text_area)/.test(n)) return 'wp_kses_post';
     return 'esc_html';
+}
+
+function isDirectOutputLine(line) {
+    return /(<\?=|echo\s+)/.test(line);
+}
+
+function isAssignmentLine(line) {
+    return /\$[a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]*\s*=/.test(line);
 }
 
 export function runSecurityScan(options = {
@@ -39,9 +52,10 @@ export function runSecurityScan(options = {
         const newLines = lines.map((line, i) => {
             if (!/scf::get/i.test(line) || escP.test(line)) return line;
 
+            const level = isDirectOutputLine(line) && !isAssignmentLine(line) ? 'WARNING' : 'NOTICE';
             return line.replace(scfP, (match, q, field) => {
                 const func = guess(field, line);
-                console.log(`[FOUND] Line ${i+1}: ${field} -> needs ${func}()`);
+                console.log(`[${level}] Line ${i+1}: ${field} -> needs ${func}()`);
                 return options.fix ? `${func}(${match})` : match;
             });
         });
