@@ -19,6 +19,17 @@ function blockingReason(code, message) {
     return { code, message };
 }
 
+export function createWindowsPowerShellEnvironment(sourceEnvironment, filePath) {
+    const childEnvironment = {
+        ...sourceEnvironment,
+        WPB_SECURITY_METADATA_TARGET: filePath
+    };
+    for (const key of Object.keys(childEnvironment)) {
+        if (key.toLowerCase() === 'psmodulepath') delete childEnvironment[key];
+    }
+    return childEnvironment;
+}
+
 const WINDOWS_INSPECTION_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $target = [Environment]::GetEnvironmentVariable('WPB_SECURITY_METADATA_TARGET')
@@ -136,10 +147,7 @@ function inspectWindows(filePath, spawn = spawnSync, options = {}) {
     ], {
         encoding: 'utf8',
         windowsHide: true,
-        env: {
-            ...process.env,
-            WPB_SECURITY_METADATA_TARGET: filePath
-        },
+        env: createWindowsPowerShellEnvironment(process.env, filePath),
         maxBuffer: 4 * 1024 * 1024
     });
     if (result.error || result.status !== 0) return {

@@ -8,6 +8,10 @@ import {
     takeSecurityFileSnapshot
 } from '../../lib/security/fix-plan.js';
 import {
+    createWindowsPowerShellEnvironment,
+    inspectSecurityMetadata
+} from '../../lib/security/metadata.js';
+import {
     phpIntegrationTestOptions,
     securityFixIntegrationTestOptions
 } from '../helpers/php-runtime.mjs';
@@ -47,6 +51,120 @@ const linuxMetadataPhpOptions = process.platform === 'linux'
 function blockingCodes(plan) {
     return plan.blockingReasons.map(reason => reason.code);
 }
+
+test('Windows PowerShell child environment removes only PSModulePath case-insensitively', async t => {
+    for (const key of ['PSModulePath', 'PSMODULEPATH', 'psmodulepath', 'PsMoDuLePaTh']) {
+        await t.test(key, () => {
+            const sourceEnvironment = {
+                PATH: 'C:\\Windows\\System32',
+                SystemRoot: 'C:\\Windows',
+                TEMP: 'C:\\Temp',
+                TMP: 'C:\\Temp',
+                USERPROFILE: 'C:\\Users\\fixture',
+                WinPSModulePath: 'C:\\WindowsPowerShell\\Modules',
+                [key]: 'C:\\Program Files\\PowerShell\\7\\Modules'
+            };
+            const originalEnvironment = { ...sourceEnvironment };
+            const childEnvironment = createWindowsPowerShellEnvironment(
+                sourceEnvironment,
+                'C:\\fixture\\case.php'
+            );
+
+            assert.deepEqual(sourceEnvironment, originalEnvironment);
+            assert.equal(
+                Object.keys(childEnvironment).some(name => name.toLowerCase() === 'psmodulepath'),
+                false
+            );
+            assert.equal(childEnvironment.PATH, sourceEnvironment.PATH);
+            assert.equal(childEnvironment.SystemRoot, sourceEnvironment.SystemRoot);
+            assert.equal(childEnvironment.TEMP, sourceEnvironment.TEMP);
+            assert.equal(childEnvironment.TMP, sourceEnvironment.TMP);
+            assert.equal(childEnvironment.USERPROFILE, sourceEnvironment.USERPROFILE);
+            assert.equal(childEnvironment.WinPSModulePath, sourceEnvironment.WinPSModulePath);
+            assert.equal(childEnvironment.WPB_SECURITY_METADATA_TARGET, 'C:\\fixture\\case.php');
+        });
+    }
+
+    await t.test('PSModulePath absent', () => {
+        const sourceEnvironment = {
+            PATH: 'C:\\Windows\\System32',
+            WinPSModulePath: 'C:\\WindowsPowerShell\\Modules'
+        };
+        const childEnvironment = createWindowsPowerShellEnvironment(
+            sourceEnvironment,
+            'C:\\fixture\\case.php'
+        );
+        assert.deepEqual(sourceEnvironment, {
+            PATH: 'C:\\Windows\\System32',
+            WinPSModulePath: 'C:\\WindowsPowerShell\\Modules'
+        });
+        assert.equal(childEnvironment.PATH, sourceEnvironment.PATH);
+        assert.equal(childEnvironment.WinPSModulePath, sourceEnvironment.WinPSModulePath);
+        assert.equal(
+            Object.keys(childEnvironment).some(name => name.toLowerCase() === 'psmodulepath'),
+            false
+        );
+        assert.equal(childEnvironment.WPB_SECURITY_METADATA_TARGET, 'C:\\fixture\\case.php');
+    });
+});
+
+test('Windows metadata inspection passes a sanitized copy to powershell.exe', () => {
+    const originalEnvironment = { ...process.env };
+    let spawnCall;
+    const windowsResponse = {
+        readonly: false,
+        attributes: 128,
+        aclProtected: false,
+        explicitAccessRuleCount: 0,
+        ownerSid: 'S-1-5-21-fixture',
+        groupSid: 'S-1-5-21-fixture',
+        currentSid: 'S-1-5-21-fixture',
+        daclSddl: 'fixture',
+        daclOnlySddl: 'fixture',
+        daclState: 'present',
+        daclRevision: 2,
+        streams: []
+    };
+    const metadata = inspectSecurityMetadata('C:\\fixture\\case.php', {
+        dev: 1,
+        ino: 2,
+        nlink: 1,
+        mode: 0,
+        uid: 0,
+        gid: 0
+    }, {
+        platform: 'win32',
+        spawnSync(command, args, options) {
+            spawnCall = { command, args, options };
+            return {
+                status: 0,
+                stdout: JSON.stringify(windowsResponse),
+                stderr: ''
+            };
+        },
+        nativeInspector: () => ({
+            status: 'unavailable',
+            inspected: false,
+            code: 'WINDOWS_NATIVE_INSPECTOR_UNAVAILABLE',
+            message: 'fixture'
+        })
+    });
+
+    assert.equal(spawnCall.command, 'powershell.exe');
+    assert.equal(
+        Object.keys(spawnCall.options.env).some(key => key.toLowerCase() === 'psmodulepath'),
+        false
+    );
+    for (const key of ['PATH', 'SystemRoot', 'TEMP', 'TMP', 'USERPROFILE', 'WinPSModulePath']) {
+        if (Object.hasOwn(process.env, key)) {
+            assert.equal(spawnCall.options.env[key], process.env[key]);
+        }
+    }
+    assert.equal(spawnCall.options.env.WPB_SECURITY_METADATA_TARGET, 'C:\\fixture\\case.php');
+    assert.deepEqual({ ...process.env }, originalEnvironment);
+    assert.equal(metadata.capability.inspectable, true);
+    assert.equal(metadata.nativeShadow.compared, false);
+});
 
 test('Windows protected explicit ACL is blocked before rename', windowsPhpOptions, async t => {
     const root = createTempWorkspace(t, 'metadata-acl');
