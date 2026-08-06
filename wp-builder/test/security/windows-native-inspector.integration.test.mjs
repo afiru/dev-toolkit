@@ -19,13 +19,35 @@ const integrationOptions = process.platform !== 'win32'
         ? { skip: `Native inspector binary is not built: ${helperPath}` }
         : {};
 
-test('test-only helper override accepts a regular file inside RUNNER_TEMP', t => {
+test('test-only helper override canonicalizes a regular file inside RUNNER_TEMP', t => {
     const runnerTemp = createTempWorkspace(t, 'windows-helper-path');
     const helper = writeTempFile(runnerTemp, 'bin/helper.exe', 'fixture');
     assert.equal(resolveWindowsNativeInspectorTestPath({
         WPB_TEST_WINDOWS_INSPECTOR_PATH: helper,
         RUNNER_TEMP: runnerTemp
-    }), path.resolve(helper));
+    }), fs.realpathSync.native(helper));
+});
+
+test('test-only helper override accepts canonical long paths', t => {
+    const runnerTemp = createTempWorkspace(t, 'windows-helper-long-path');
+    const helper = writeTempFile(runnerTemp, 'bin/helper.exe', 'fixture');
+    const realRunnerTemp = fs.realpathSync.native(runnerTemp);
+    const realHelper = fs.realpathSync.native(helper);
+    assert.equal(resolveWindowsNativeInspectorTestPath({
+        WPB_TEST_WINDOWS_INSPECTOR_PATH: realHelper,
+        RUNNER_TEMP: realRunnerTemp
+    }), realHelper);
+});
+
+test('test-only helper override accepts Windows path case aliases', {
+    skip: process.platform === 'win32' ? false : 'Windows paths are case-insensitive.'
+}, t => {
+    const runnerTemp = createTempWorkspace(t, 'windows-helper-path-case');
+    const helper = writeTempFile(runnerTemp, 'bin/helper.exe', 'fixture');
+    assert.equal(resolveWindowsNativeInspectorTestPath({
+        WPB_TEST_WINDOWS_INSPECTOR_PATH: helper.toUpperCase(),
+        RUNNER_TEMP: runnerTemp.toUpperCase()
+    }), fs.realpathSync.native(helper));
 });
 
 test('test-only helper override rejects paths outside RUNNER_TEMP', t => {
@@ -35,6 +57,59 @@ test('test-only helper override rejects paths outside RUNNER_TEMP', t => {
     const helper = writeTempFile(root, 'outside/helper.exe', 'fixture');
     assert.throws(() => resolveWindowsNativeInspectorTestPath({
         WPB_TEST_WINDOWS_INSPECTOR_PATH: helper,
+        RUNNER_TEMP: runnerTemp
+    }), /inside RUNNER_TEMP/);
+});
+
+test('test-only helper override rejects a sibling prefix path', t => {
+    const root = createTempWorkspace(t, 'windows-helper-prefix');
+    const runnerTemp = path.join(root, 'runner');
+    fs.mkdirSync(runnerTemp);
+    const helper = writeTempFile(root, 'runner-sibling/helper.exe', 'fixture');
+    assert.throws(() => resolveWindowsNativeInspectorTestPath({
+        WPB_TEST_WINDOWS_INSPECTOR_PATH: helper,
+        RUNNER_TEMP: runnerTemp
+    }), /inside RUNNER_TEMP/);
+});
+
+test('test-only helper override rejects a symlink helper file', t => {
+    const runnerTemp = createTempWorkspace(t, 'windows-helper-symlink');
+    const target = writeTempFile(runnerTemp, 'bin/target.exe', 'fixture');
+    const helper = path.join(runnerTemp, 'bin/helper.exe');
+    try {
+        fs.symlinkSync(target, helper, 'file');
+    } catch (error) {
+        if (process.platform === 'win32' && error.code === 'EPERM') {
+            t.skip('Symlink creation requires Windows Developer Mode or privilege.');
+            return;
+        }
+        throw error;
+    }
+    assert.throws(() => resolveWindowsNativeInspectorTestPath({
+        WPB_TEST_WINDOWS_INSPECTOR_PATH: helper,
+        RUNNER_TEMP: runnerTemp
+    }), /regular, non-symlink file/);
+});
+
+test('test-only helper override rejects a directory reparse escape', t => {
+    const root = createTempWorkspace(t, 'windows-helper-reparse');
+    const runnerTemp = path.join(root, 'runner');
+    const outside = path.join(root, 'outside');
+    const linkedDirectory = path.join(runnerTemp, 'linked');
+    fs.mkdirSync(runnerTemp);
+    fs.mkdirSync(outside);
+    const target = writeTempFile(outside, 'helper.exe', 'fixture');
+    try {
+        fs.symlinkSync(outside, linkedDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (error) {
+        if (process.platform === 'win32' && error.code === 'EPERM') {
+            t.skip('Junction creation is unavailable in this environment.');
+            return;
+        }
+        throw error;
+    }
+    assert.throws(() => resolveWindowsNativeInspectorTestPath({
+        WPB_TEST_WINDOWS_INSPECTOR_PATH: path.join(linkedDirectory, path.basename(target)),
         RUNNER_TEMP: runnerTemp
     }), /inside RUNNER_TEMP/);
 });

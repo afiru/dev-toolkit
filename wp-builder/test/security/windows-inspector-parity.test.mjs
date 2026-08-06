@@ -17,13 +17,25 @@ const parityOptions = process.platform !== 'win32'
         : {};
 
 function snapshot(file) {
-    return takeSecurityFileSnapshot(file, {
+    // GitHub-hosted Windows runners may expose os.tmpdir() through an 8.3 alias.
+    // Inspect the canonical target so PowerShell and the native helper receive
+    // the same long-path representation.
+    const canonicalFile = fs.realpathSync.native(file);
+    return takeSecurityFileSnapshot(canonicalFile, {
         metadata: { nativeInspectorOptions: { helperPath } }
     });
 }
 
 function assertParity(file) {
     const result = snapshot(file);
+    assert.equal(result.state, 'present', result.reason);
+    assert.equal(result.metadata.capability.inspectable, true, JSON.stringify({
+        blockingReasons: result.metadata.capability.blockingReasons
+    }));
+    assert.ok(result.metadata.nativeShadow, 'Native shadow result is missing.');
+    assert.equal(result.metadata.nativeShadow.native?.inspected, true, JSON.stringify({
+        native: result.metadata.nativeShadow.native
+    }));
     assert.equal(result.metadata.nativeShadow.compared, true);
     assert.equal(result.metadata.nativeShadow.matching, true, JSON.stringify({
         differences: result.metadata.nativeShadow.differences
