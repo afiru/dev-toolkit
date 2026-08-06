@@ -127,7 +127,7 @@ jobs:
             Where-Object { $_ -ne '' })
           $sdkSelection = @{}
           foreach ($line in $sdkSelectionLines) {
-            $match = [regex]::Match($line, '^(WindowsTargetPlatformVersion|WindowsSDKVersion|UCRTVersion)=(.*)$')
+            $match = [regex]::Match($line, '^(RecordTarget|WindowsTargetPlatformVersion|WindowsSDKVersion|UCRTVersion)=(.*)$')
             if (-not $match.Success) {
               throw 'MSBuild returned a malformed Windows SDK selection record.'
             }
@@ -138,13 +138,16 @@ jobs:
             $sdkSelection[$name] = $match.Groups[2].Value.Trim()
           }
           Write-Host "SDK selection record lines: $($sdkSelectionLines.Count)"
-          foreach ($name in @('WindowsTargetPlatformVersion', 'WindowsSDKVersion', 'UCRTVersion')) {
+          foreach ($name in @('RecordTarget', 'WindowsTargetPlatformVersion', 'WindowsSDKVersion', 'UCRTVersion')) {
             $displayValue = if ($sdkSelection.ContainsKey($name) -and $sdkSelection[$name] -ne '') {
               $sdkSelection[$name]
             } else {
               '<empty>'
             }
             Write-Host "${name}: $displayValue"
+          }
+          if ([string]$sdkSelection['RecordTarget'] -ne 'Build') {
+            throw 'MSBuild SDK selection record was not produced after the Build target.'
           }
 
           function ConvertTo-WpbSdkVersion([string]$Name, [string]$Value, [bool]$Required) {

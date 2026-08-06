@@ -55,10 +55,10 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
   </ItemGroup>
-  <Target Name="WriteWpbWindowsSdkSelection" AfterTargets="PrepareForBuild" Condition="'$(WpbWindowsSdkSelectionFile)' != ''">
+  <Target Name="WriteWpbWindowsSdkSelection" AfterTargets="Build" Condition="'$(WpbWindowsSdkSelectionFile)' != ''">
     <WriteLinesToFile
       File="$(WpbWindowsSdkSelectionFile)"
-      Lines="WindowsTargetPlatformVersion=$(WindowsTargetPlatformVersion);WindowsSDKVersion=$(WindowsSDKVersion);UCRTVersion=$(UCRTVersion)"
+      Lines="RecordTarget=Build;WindowsTargetPlatformVersion=$(WindowsTargetPlatformVersion);WindowsSDKVersion=$(WindowsSDKVersion);UCRTVersion=$(UCRTVersion)"
       Overwrite="true"
       Encoding="UTF-8" />
   </Target>
