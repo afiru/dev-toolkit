@@ -15,15 +15,26 @@ test('security:fix CLI preview and option contract', securityFixIntegrationTestO
         assert.equal(result.status, 0);
         assert.match(result.stdout, /Security Fix Preview/);
         assert.match(result.stdout, /No files changed\./);
+        if (process.platform === 'win32') {
+            assert.match(result.stderr, /WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA/);
+        }
         assert.equal(sha256(fs.readFileSync(file)), before);
     });
 
     await t.test('--apply --yes applies one file', st => {
         const root = createTempWorkspace(st, 'cli-apply');
         const file = writeTempFile(root, 'case.php', "<p><?= SCF::get('title') ?></p>\n");
+        const before = sha256(fs.readFileSync(file));
         const result = runCli(root, ['security:fix', '--file', 'case.php', '--apply', '--yes']);
-        assert.equal(result.status, 0);
-        assert.match(fs.readFileSync(file, 'utf8'), /esc_html\(SCF::get/);
+        if (process.platform === 'win32') {
+            assert.equal(result.status, 2);
+            assert.match(result.stderr, /WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA/);
+            assert.match(result.stderr, /Windows apply is unsupported/);
+            assert.equal(sha256(fs.readFileSync(file)), before);
+        } else {
+            assert.equal(result.status, 0);
+            assert.match(fs.readFileSync(file, 'utf8'), /esc_html\(SCF::get/);
+        }
     });
 
     await t.test('--yes without --apply fails without writing', st => {
@@ -40,7 +51,10 @@ test('security:fix CLI preview and option contract', securityFixIntegrationTestO
         const file = writeTempFile(root, 'case.php', "<p><?= SCF::get('title') ?></p>\n");
         const before = sha256(fs.readFileSync(file));
         const result = runCli(root, ['security:fix', '--file', 'case.php', '--apply']);
-        assert.equal(result.status, 1);
+        assert.equal(result.status, process.platform === 'win32' ? 2 : 1);
+        if (process.platform === 'win32') {
+            assert.match(result.stderr, /WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA/);
+        }
         assert.equal(sha256(fs.readFileSync(file)), before);
     });
 

@@ -216,6 +216,11 @@ test('Windows metadata inspection passes a sanitized copy to powershell.exe', ()
     assert.deepEqual({ ...process.env }, originalEnvironment);
     assert.equal(metadata.capability.inspectable, true);
     assert.equal(metadata.nativeShadow.compared, false);
+    assert.equal(
+        metadata.capability.blockingReasons[0].code,
+        'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
+    );
+    assert.equal(metadata.capability.reproducible, false);
 });
 
 test('Windows protected explicit ACL is blocked before rename', windowsPhpOptions, async t => {
@@ -227,10 +232,11 @@ test('Windows protected explicit ACL is blocked before rename', windowsPhpOption
     const plan = buildSecurityFixPlan({ workspaceRoot: root, file });
     assertTempTarget(root, plan.targetPath);
     assert.equal(plan.canApply, false);
+    assert.equal(blockingCodes(plan)[0], 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA');
     assert.ok(blockingCodes(plan).includes('WINDOWS_SPECIAL_ACL'));
     await assert.rejects(
         () => applySecurityFixPlan(plan, { assumeYes: true }),
-        error => error.exitCode === 2 && error.code === 'PLAN_BLOCKED'
+        error => error.exitCode === 2 && error.code === 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
     );
     assert.equal(windowsAcl(file), before);
     assert.deepEqual(fs.readFileSync(file), source);
@@ -246,10 +252,11 @@ test('Windows read-only target is blocked at Plan time', windowsPhpOptions, asyn
         const plan = buildSecurityFixPlan({ workspaceRoot: root, file });
         assertTempTarget(root, plan.targetPath);
         assert.equal(plan.canApply, false);
+        assert.equal(blockingCodes(plan)[0], 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA');
         assert.ok(blockingCodes(plan).includes('READ_ONLY_TARGET'));
         await assert.rejects(
             () => applySecurityFixPlan(plan, { assumeYes: true }),
-            error => error.exitCode === 2 && error.code === 'PLAN_BLOCKED'
+            error => error.exitCode === 2 && error.code === 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
         );
         assert.deepEqual(fs.readFileSync(file), source);
         assertNoSecurityArtifacts(root);
@@ -264,10 +271,11 @@ test('Windows alternate data stream is blocked before rename', windowsPhpOptions
     fs.writeFileSync(`${file}:wpb-metadata-test`, 'metadata');
     const plan = buildSecurityFixPlan({ workspaceRoot: root, file });
     assert.equal(plan.canApply, false);
+    assert.equal(blockingCodes(plan)[0], 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA');
     assert.ok(blockingCodes(plan).includes('WINDOWS_ADS_UNSUPPORTED'));
     await assert.rejects(
         () => applySecurityFixPlan(plan, { assumeYes: true }),
-        error => error.exitCode === 2 && error.code === 'PLAN_BLOCKED'
+        error => error.exitCode === 2 && error.code === 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
     );
     assert.deepEqual(fs.readFileSync(file), source);
     assert.equal(fs.readFileSync(`${file}:wpb-metadata-test`, 'utf8'), 'metadata');
@@ -285,7 +293,11 @@ test('hard-linked target is blocked before rename', phpIntegrationTestOptions(),
     assert.ok(blockingCodes(plan).includes('HARD_LINK_TARGET'));
     await assert.rejects(
         () => applySecurityFixPlan(plan, { assumeYes: true }),
-        error => error.exitCode === 2 && error.code === 'PLAN_BLOCKED'
+        error => error.exitCode === 2 && error.code === (
+            process.platform === 'win32'
+                ? 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
+                : 'PLAN_BLOCKED'
+        )
     );
     assert.deepEqual(fs.readFileSync(file), source);
     assert.deepEqual(fs.readFileSync(linked), source);
@@ -308,12 +320,15 @@ test('unavailable Windows metadata inspection fails closed', windowsPhpOptions, 
         }
     });
     assert.equal(plan.canApply, false);
+    assert.equal(blockingCodes(plan)[0], 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA');
     assert.ok(blockingCodes(plan).includes('UNSUPPORTED_WINDOWS_METADATA'));
     assert.deepEqual(fs.readFileSync(file), source);
     assertNoSecurityArtifacts(root);
 });
 
-test('file identity change with identical bytes is stale', securityFixIntegrationTestOptions(), async t => {
+test('file identity change with identical bytes is stale', process.platform === 'win32'
+    ? { skip: 'Windows apply is unsupported by the strict metadata contract.' }
+    : securityFixIntegrationTestOptions(), async t => {
     const root = createTempWorkspace(t, 'metadata-identity-stale');
     const file = writeTempFile(root, 'case.php', source);
     const replacement = writeTempFile(root, 'replacement.php', source);
@@ -328,7 +343,9 @@ test('file identity change with identical bytes is stale', securityFixIntegratio
     assertNoSecurityArtifacts(root);
 });
 
-test('metadata change after preview is stale and preserves the original', securityFixIntegrationTestOptions(), async t => {
+test('metadata change after preview is stale and preserves the original', process.platform === 'win32'
+    ? { skip: 'Windows apply is unsupported by the strict metadata contract.' }
+    : securityFixIntegrationTestOptions(), async t => {
     const root = createTempWorkspace(t, 'metadata-stale');
     const file = writeTempFile(root, 'case.php', source);
     const plan = buildSecurityFixPlan({ workspaceRoot: root, file });
@@ -355,7 +372,9 @@ test('metadata change after preview is stale and preserves the original', securi
     }
 });
 
-test('metadata change after temp validation stops before rename and cleans artifacts', securityFixIntegrationTestOptions(), async t => {
+test('metadata change after temp validation stops before rename and cleans artifacts', process.platform === 'win32'
+    ? { skip: 'Windows apply is unsupported by the strict metadata contract.' }
+    : securityFixIntegrationTestOptions(), async t => {
     const root = createTempWorkspace(t, 'metadata-stale-after-temp');
     const file = writeTempFile(root, 'case.php', source);
     const plan = buildSecurityFixPlan({ workspaceRoot: root, file });

@@ -19,6 +19,26 @@ function blockingReason(code, message) {
     return { code, message };
 }
 
+export const WINDOWS_APPLY_UNSUPPORTED_CODE = 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA';
+export const WINDOWS_APPLY_UNSUPPORTED_MESSAGE =
+    'Windows apply is unsupported because strict metadata preservation cannot be guaranteed.';
+
+function blockWindowsApply(inspection) {
+    const existingReasons = inspection.capability?.blockingReasons ?? [];
+    const blockingReasons = [
+        blockingReason(WINDOWS_APPLY_UNSUPPORTED_CODE, WINDOWS_APPLY_UNSUPPORTED_MESSAGE),
+        ...existingReasons.filter(reason => reason.code !== WINDOWS_APPLY_UNSUPPORTED_CODE)
+    ];
+    return {
+        ...inspection,
+        capability: {
+            ...inspection.capability,
+            reproducible: false,
+            blockingReasons
+        }
+    };
+}
+
 export function createWindowsPowerShellEnvironment(sourceEnvironment, filePath) {
     const childEnvironment = {
         ...sourceEnvironment,
@@ -278,7 +298,7 @@ export function inspectSecurityMetadata(filePath, stat, options = {}) {
     };
     if (platform === 'win32') {
         const inspection = inspectWindows(filePath, options.spawnSync ?? spawnSync, options);
-        return { ...base, ...inspection };
+        return { ...base, ...blockWindowsApply(inspection) };
     }
 
     if (platform === 'linux') return {
@@ -293,10 +313,14 @@ export function inspectSecurityMetadata(filePath, stat, options = {}) {
 
 export function metadataBlockingReasons(metadata) {
     const reasons = [...(metadata?.capability?.blockingReasons ?? [])];
-    if ((metadata?.identity?.nlink ?? 0) > 1) reasons.unshift(blockingReason(
-        'HARD_LINK_TARGET',
-        'Hard-linked files are not eligible for Security Fix apply.'
-    ));
+    if ((metadata?.identity?.nlink ?? 0) > 1) {
+        const hardLinkReason = blockingReason(
+            'HARD_LINK_TARGET',
+            'Hard-linked files are not eligible for Security Fix apply.'
+        );
+        if (metadata?.platform === 'win32') reasons.push(hardLinkReason);
+        else reasons.unshift(hardLinkReason);
+    }
     return reasons;
 }
 

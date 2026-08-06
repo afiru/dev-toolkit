@@ -526,6 +526,7 @@ SecurityInspection inspectSecurity(HANDLE file) {
     return result;
 }
 
+#if defined(WPB_EXPERIMENTAL_WINDOWS_REPLACE)
 struct SecurityDescriptorSnapshot {
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     PSID owner = nullptr;
@@ -582,6 +583,7 @@ SecurityDescriptorSnapshot captureSecurityDescriptor(const std::wstring& path) {
     snapshot.dacl = descriptorDacl;
     return snapshot;
 }
+#endif
 
 struct StreamEntry { std::wstring name; std::uint64_t size = 0; std::string hash; };
 struct StreamInspection {
@@ -941,6 +943,7 @@ std::string inspect(const std::wstring& targetPath, const std::string& requestId
     return output.str();
 }
 
+#if defined(WPB_EXPERIMENTAL_WINDOWS_REPLACE)
 struct ReplaceSnapshot {
     std::string contentSha256;
     std::string size;
@@ -1649,6 +1652,7 @@ std::string replaceFiles(const JsonValue& request, const std::string& requestId)
         ",\"ok\":true,\"operation\":\"replace\",\"transaction\":{\"state\":\"COMMITTED\",\"replaceFileFlags\":0,\"backupRemoved\":true,\"rollback\":{\"attempted\":false,\"succeeded\":false,\"recoveryArtifactRetained\":false}},\"validation\":" +
         validationDiagnosticsJson(validationDiagnostics) + "}";
 }
+#endif
 
 } // namespace
 
@@ -1678,9 +1682,13 @@ int main() {
             return 2;
         }
         if (operation == "replace") {
+#if defined(WPB_EXPERIMENTAL_WINDOWS_REPLACE)
             if (schemaVersion != 2) throw InspectionError("OPERATION_UNSUPPORTED", ERROR_INVALID_FUNCTION, "protocol", "Replace requires protocol v2.");
             std::cout << replaceFiles(request, requestId);
             return 0;
+#else
+            throw InspectionError("OPERATION_UNSUPPORTED", ERROR_INVALID_FUNCTION, "protocol", "Replace is unavailable in the inspection-only release helper.");
+#endif
         }
         if (operation != "inspect") throw InspectionError("OPERATION_UNSUPPORTED", ERROR_INVALID_FUNCTION, "protocol", "Operation is unsupported.");
         const JsonValue& target = required(request, "target", JsonValue::Type::Object);

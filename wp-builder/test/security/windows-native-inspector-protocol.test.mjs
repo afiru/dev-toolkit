@@ -99,7 +99,7 @@ test('Windows native inspector accepts a valid protocol v1 response', () => {
     assert.equal(result.response.capabilities.completeForReplace, false);
 });
 
-test('protocol v1 inspect remains stable and protocol v2 defines replace snapshots', () => {
+test('protocol v1 inspect remains stable and protocol v2 marks replace experimental', () => {
     const testDirectory = path.dirname(fileURLToPath(import.meta.url));
     const protocolDirectory = path.resolve(testDirectory, '..', '..', 'native', 'windows-inspector');
     const v1 = JSON.parse(fs.readFileSync(path.join(protocolDirectory, 'protocol-schema-v1.json'), 'utf8'));
@@ -108,6 +108,11 @@ test('protocol v1 inspect remains stable and protocol v2 defines replace snapsho
     assert.equal(v2.oneOf[0].properties.schemaVersion.const, 2);
     assert.equal(v1.oneOf[0].properties.operation.const, 'inspect');
     assert.equal(v2.oneOf[0].properties.operation.const, 'inspect');
+    assert.deepEqual(v2['x-wpb-capabilities'], {
+        releaseOperations: ['inspect'],
+        experimentalOperations: ['replace'],
+        replaceStatus: 'experimental-unsupported-for-production'
+    });
     assert.equal(v2.oneOf[1].properties.operation.const, 'replace');
     assert.deepEqual(v2.oneOf[1].required, [
         'schemaVersion', 'operation', 'requestId', 'target', 'replacement', 'backup'
@@ -262,5 +267,7 @@ test('PowerShell remains authoritative when shadow parity differs', () => {
     assert.equal(metadata.nativeShadow.matching, false);
     assert.deepEqual(metadata.nativeShadow.differences, ['readonly']);
     assert.equal(metadata.nativeShadow.diagnostic.code, 'WINDOWS_INSPECTOR_PARITY_MISMATCH');
-    assert.deepEqual(metadataBlockingReasons(metadata), []);
+    assert.deepEqual(metadataBlockingReasons(metadata).map(reason => reason.code), [
+        'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
+    ]);
 });

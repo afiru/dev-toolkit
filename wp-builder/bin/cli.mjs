@@ -160,11 +160,6 @@ program
         }
 
         const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
-        if (options.apply && !options.yes && !isTTY) {
-            console.error('[ERROR] Non-interactive apply requires --yes.');
-            process.exitCode = 1;
-            return;
-        }
 
         try {
             const plan = buildSecurityFixPlan({
@@ -176,11 +171,20 @@ program
             });
 
             if (!plan.canApply) {
+                const windowsApplyUnsupported = plan.blockingReasons.some(
+                    reason => reason.code === 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
+                );
+                if (!options.apply && windowsApplyUnsupported) return;
                 console.error('Security Fix apply is blocked by the diagnostics above.');
                 process.exitCode = 2;
                 return;
             }
             if (!options.apply) return;
+            if (!options.yes && !isTTY) {
+                console.error('[ERROR] Non-interactive apply requires --yes.');
+                process.exitCode = 1;
+                return;
+            }
             if (!plan.hasChanges) {
                 console.log('No Security Fix changes to apply.');
                 return;

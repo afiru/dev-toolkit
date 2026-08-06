@@ -2,6 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wp-builder.local/schemas/windows-native-inspector-protocol-v2.json",
   "title": "wp-builder Windows native helper protocol v2",
+  "x-wpb-capabilities": {
+    "releaseOperations": ["inspect"],
+    "experimentalOperations": ["replace"],
+    "replaceStatus": "experimental-unsupported-for-production"
+  },
   "$defs": {
     "identity": {
       "type": "object",

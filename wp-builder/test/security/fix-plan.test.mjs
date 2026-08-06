@@ -25,7 +25,15 @@ test('Security Fix Plan contains immutable source and preview data without writi
     assert.equal(typeof plan.snapshot.metadata.stat.uid, 'number');
     assert.equal(typeof plan.snapshot.metadata.stat.gid, 'number');
     assert.equal(plan.snapshot.metadata.capability.inspectable, true);
-    assert.deepEqual(plan.snapshot.metadata.capability.blockingReasons, []);
+    const windowsApplyUnsupported = process.platform === 'win32';
+    if (windowsApplyUnsupported) {
+        assert.equal(
+            plan.snapshot.metadata.capability.blockingReasons[0].code,
+            'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
+        );
+    } else {
+        assert.deepEqual(plan.snapshot.metadata.capability.blockingReasons, []);
+    }
     assert.deepEqual(plan.originalBytes, input);
     assert.notDeepEqual(plan.desiredBytes, input);
     assert.equal(plan.desiredHash, sha256(plan.desiredBytes));
@@ -35,7 +43,7 @@ test('Security Fix Plan contains immutable source and preview data without writi
     assert.match(plan.diff, /^\+\+\+ b\/case\.php/m);
     assert.equal(plan.lint.available, true);
     assert.equal(plan.lint.passed, true);
-    assert.equal(plan.canApply, true);
+    assert.equal(plan.canApply, !windowsApplyUnsupported);
     const phpRuntime = inspectPhpRuntime();
     assert.equal(plan.tokenizer.runtime.phpVersion, phpRuntime.phpVersion);
     assert.equal(plan.tokenizer.runtime.tokenizerAvailable, true);
@@ -56,6 +64,12 @@ test('Security Fix Plan contains immutable source and preview data without writi
     if (plan.snapshot.metadata.windows?.daclSddl) {
         assert.ok(!output.join('\n').includes(plan.snapshot.metadata.windows.daclSddl));
     }
-    assert.deepEqual(errors, []);
+    if (windowsApplyUnsupported) {
+        assert.ok(errors.some(line => String(line).includes(
+            '[WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA]'
+        )));
+    } else {
+        assert.deepEqual(errors, []);
+    }
     assert.deepEqual(fs.readFileSync(file), input);
 });

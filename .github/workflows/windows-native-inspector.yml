@@ -51,7 +51,6 @@ jobs:
             "/p:OutDir=$binDir\",
             "/p:IntDir=$objDir\",
             '/p:WpbEmitSdkEvidence=true',
-            '/p:WpbEnableNativeTestHooks=true',
             '/p:TargetName=wpb-windows-inspector',
             "/bl:$artifactRoot\windows-native-inspector.binlog"
           )
@@ -66,6 +65,36 @@ jobs:
           "WPB_NATIVE_HELPER_PATH=$helperPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WPB_VS_PATH=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WPB_WINDOWS_SDK_EVIDENCE_LOG=$sdkEvidenceLog" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build experimental ReplaceFileW characterization helper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msbuild = Join-Path $env:WPB_VS_PATH 'MSBuild\Current\Bin\MSBuild.exe'
+          $project = Join-Path $env:GITHUB_WORKSPACE 'wp-builder\native\windows-inspector\windows-inspector.vcxproj'
+          $binDir = Join-Path $env:RUNNER_TEMP 'wpb-windows-replace-experimental\bin'
+          $objDir = Join-Path $env:RUNNER_TEMP 'wpb-windows-replace-experimental\obj'
+          New-Item -ItemType Directory -Force -Path $binDir, $objDir | Out-Null
+          $arguments = @(
+            $project,
+            '/m',
+            '/t:Rebuild',
+            '/p:Configuration=Release',
+            '/p:Platform=x64',
+            '/p:PlatformToolset=v143',
+            "/p:OutDir=$binDir\",
+            "/p:IntDir=$objDir\",
+            '/p:WpbEnableExperimentalWindowsReplace=true',
+            '/p:WpbEnableNativeTestHooks=true',
+            '/p:TargetName=wpb-windows-replace-experimental'
+          )
+          & $msbuild @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Experimental MSBuild failed with exit code $LASTEXITCODE." }
+          $helperPath = Join-Path $binDir 'wpb-windows-replace-experimental.exe'
+          if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
+            throw 'The experimental ReplaceFileW helper EXE was not produced.'
+          }
+          "WPB_TEST_WINDOWS_REPLACE_INSPECTOR_PATH=$helperPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Validate PE security and dependencies
         shell: pwsh
@@ -83,6 +112,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'dumpbin /loadconfig failed.' }
           $dependents = (& $dumpbin /dependents $env:WPB_NATIVE_HELPER_PATH 2>&1) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw 'dumpbin /dependents failed.' }
+          $imports = (& $dumpbin /imports $env:WPB_NATIVE_HELPER_PATH 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw 'dumpbin /imports failed.' }
 
           $checks = [ordered]@{
             x64Machine = [bool]($headers -match '(?im)8664 machine \(x64\)')
@@ -90,6 +121,7 @@ jobs:
             highEntropyVa = [bool]($headers -match '(?im)High Entropy Virtual Addresses|High Entropy VA')
             nxCompatible = [bool]($headers -match '(?im)NX compatible')
             guardCf = [bool]($loadConfig -match '(?im)Guard CF')
+            replaceFileImportAbsent = [bool]($imports -notmatch '(?im)\bReplaceFileW\b')
           }
           foreach ($check in $checks.GetEnumerator()) {
             if (-not $check.Value) { throw "Required PE property is missing: $($check.Key)." }
@@ -112,7 +144,7 @@ jobs:
             checks = $checks
             dependencies = $dlls
             completeForReplace = $false
-            nativeTestHooksEnabled = $true
+            nativeTestHooksEnabled = $false
           }
           $summary | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $env:WPB_NATIVE_ARTIFACT_ROOT 'validation-summary.json') -Encoding utf8
           "WPB_MSVC_VERSION=$($toolset.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -208,325 +240,17 @@ jobs:
           php --version
           php -r "if (!extension_loaded('tokenizer')) { fwrite(STDERR, 'tokenizer unavailable'); exit(1); }"
 
-      - name: Diagnose PowerShell module-path inheritance
-        if: ${{ false }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $diagnosticRoot = Join-Path $env:RUNNER_TEMP 'wpb-powershell-diagnostic'
-          New-Item -ItemType Directory -Force -Path $diagnosticRoot | Out-Null
-          $probePath = Join-Path $diagnosticRoot 'acl-probe.txt'
-          Set-Content -LiteralPath $probePath -Value 'diagnostic only' -Encoding utf8
-
-          function Get-CommandSummary {
-            param([switch]$All)
-            try {
-              $commands = if ($All) {
-                @(Get-Command Get-Acl -All -ErrorAction Stop)
-              } else {
-                @(Get-Command Get-Acl -ErrorAction Stop)
-              }
-              return @($commands | ForEach-Object {
-                [ordered]@{
-                  name = $_.Name
-                  commandType = [string]$_.CommandType
-                  moduleName = $_.ModuleName
-                  source = $_.Source
-                  version = if ($_.Version) { $_.Version.ToString() } else { $null }
-                }
-              })
-            } catch {
-              return @([ordered]@{
-                errorType = $_.Exception.GetType().FullName
-                fullyQualifiedErrorId = $_.FullyQualifiedErrorId
-              })
-            }
-          }
-
-          function Get-ModuleSummary {
-            $modules = @(Get-Module -ListAvailable Microsoft.PowerShell.Security -ErrorAction SilentlyContinue)
-            return @($modules | ForEach-Object {
-              $manifestResult = [ordered]@{ success = $false; errorType = $null; fullyQualifiedErrorId = $null }
-              try {
-                Test-ModuleManifest -LiteralPath $_.Path -ErrorAction Stop | Out-Null
-                $manifestResult.success = $true
-              } catch {
-                $manifestResult.errorType = $_.Exception.GetType().FullName
-                $manifestResult.fullyQualifiedErrorId = $_.FullyQualifiedErrorId
-              }
-              [ordered]@{
-                name = $_.Name
-                version = $_.Version.ToString()
-                moduleBase = $_.ModuleBase
-                path = $_.Path
-                rootModule = $_.RootModule
-                compatiblePSEditions = @($_.CompatiblePSEditions)
-                powerShellVersion = if ($_.PowerShellVersion) { $_.PowerShellVersion.ToString() } else { $null }
-                requiredAssemblies = @($_.RequiredAssemblies | ForEach-Object { [string]$_ })
-                manifest = $manifestResult
-              }
-            })
-          }
-
-          $pwshDiagnostic = [ordered]@{
-            probe = 'pwsh-parent'
-            psVersion = $PSVersionTable.PSVersion.ToString()
-            psEdition = $PSVersionTable.PSEdition
-            psHome = $PSHOME
-            psModulePath = $env:PSModulePath
-            winPsModulePath = $env:WinPSModulePath
-            getAcl = Get-CommandSummary
-            getAclAll = Get-CommandSummary -All
-            securityModules = Get-ModuleSummary
-          }
-          '=== pwsh parent ==='
-          $pwshDiagnostic | ConvertTo-Json -Depth 8
-
-          $childScript = Join-Path $diagnosticRoot 'inspect-windows-powershell.ps1'
-          @'
-          param(
-            [Parameter(Mandatory = $true)][string]$ProbePath,
-            [ValidateSet('standard', 'absolute-manifest')][string]$Mode = 'standard'
-          )
-          $ErrorActionPreference = 'Stop'
-
-          function Convert-CommandSummary {
-            param([switch]$All)
-            try {
-              $commands = if ($All) {
-                @(Get-Command Get-Acl -All -ErrorAction Stop)
-              } else {
-                @(Get-Command Get-Acl -ErrorAction Stop)
-              }
-              return @($commands | ForEach-Object {
-                [ordered]@{
-                  name = $_.Name
-                  commandType = [string]$_.CommandType
-                  moduleName = $_.ModuleName
-                  source = $_.Source
-                  version = if ($_.Version) { $_.Version.ToString() } else { $null }
-                }
-              })
-            } catch {
-              return @([ordered]@{
-                errorType = $_.Exception.GetType().FullName
-                fullyQualifiedErrorId = $_.FullyQualifiedErrorId
-              })
-            }
-          }
-
-          function Convert-ModuleSummary {
-            param($Module)
-            if (-not $Module) { return $null }
-            return [ordered]@{
-              name = $Module.Name
-              version = $Module.Version.ToString()
-              moduleBase = $Module.ModuleBase
-              path = $Module.Path
-              rootModule = $Module.RootModule
-              compatiblePSEditions = @($Module.CompatiblePSEditions)
-              powerShellVersion = if ($Module.PowerShellVersion) { $Module.PowerShellVersion.ToString() } else { $null }
-              requiredAssemblies = @($Module.RequiredAssemblies | ForEach-Object { [string]$_ })
-            }
-          }
-
-          function Invoke-SafeImport {
-            param([Parameter(Mandatory = $true)][string]$NameOrPath)
-            $result = [ordered]@{
-              success = $false
-              module = $null
-              errorType = $null
-              fullyQualifiedErrorId = $null
-            }
-            try {
-              $module = Import-Module -Name $NameOrPath -Force -PassThru -Verbose -ErrorAction Stop 4>$null |
-                Select-Object -First 1
-              $result.success = $true
-              $result.module = Convert-ModuleSummary $module
-            } catch {
-              $result.errorType = $_.Exception.GetType().FullName
-              $result.fullyQualifiedErrorId = $_.FullyQualifiedErrorId
-            }
-            return $result
-          }
-
-          $candidates = @(Get-Module -ListAvailable Microsoft.PowerShell.Security -ErrorAction SilentlyContinue)
-          $candidateSummaries = @($candidates | ForEach-Object {
-            $manifest = [ordered]@{ success = $false; errorType = $null; fullyQualifiedErrorId = $null }
-            try {
-              Test-ModuleManifest -LiteralPath $_.Path -ErrorAction Stop | Out-Null
-              $manifest.success = $true
-            } catch {
-              $manifest.errorType = $_.Exception.GetType().FullName
-              $manifest.fullyQualifiedErrorId = $_.FullyQualifiedErrorId
-            }
-            $summary = Convert-ModuleSummary $_
-            $summary.manifest = $manifest
-            $summary
-          })
-
-          $absoluteManifest = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
-          $absoluteManifestCheck = [ordered]@{
-            path = $absoluteManifest
-            underPsHome = $false
-            exists = $false
-            manifestValid = $false
-            errorType = $null
-            fullyQualifiedErrorId = $null
-          }
-          try {
-            $resolvedPsHome = [IO.Path]::GetFullPath($PSHOME).TrimEnd('\') + '\'
-            $resolvedManifest = [IO.Path]::GetFullPath($absoluteManifest)
-            $absoluteManifestCheck.underPsHome = $resolvedManifest.StartsWith(
-              $resolvedPsHome,
-              [StringComparison]::OrdinalIgnoreCase
-            )
-            $absoluteManifestCheck.exists = Test-Path -LiteralPath $absoluteManifest -PathType Leaf
-            if ($absoluteManifestCheck.underPsHome -and $absoluteManifestCheck.exists) {
-              Test-ModuleManifest -LiteralPath $absoluteManifest -ErrorAction Stop | Out-Null
-              $absoluteManifestCheck.manifestValid = $true
-            }
-          } catch {
-            $absoluteManifestCheck.errorType = $_.Exception.GetType().FullName
-            $absoluteManifestCheck.fullyQualifiedErrorId = $_.FullyQualifiedErrorId
-          }
-
-          $importTarget = 'Microsoft.PowerShell.Security'
-          if ($Mode -eq 'absolute-manifest') {
-            if (-not ($absoluteManifestCheck.underPsHome -and $absoluteManifestCheck.exists -and $absoluteManifestCheck.manifestValid)) {
-              $importResult = [ordered]@{
-                success = $false
-                module = $null
-                errorType = 'ABSOLUTE_MANIFEST_PREFLIGHT_FAILED'
-                fullyQualifiedErrorId = $absoluteManifestCheck.fullyQualifiedErrorId
-              }
-            } else {
-              $importTarget = $absoluteManifest
-              $importResult = Invoke-SafeImport -NameOrPath $importTarget
-            }
-          } else {
-            $importResult = Invoke-SafeImport -NameOrPath $importTarget
-          }
-
-          $getAclResult = [ordered]@{
-            success = $false
-            errorType = $null
-            fullyQualifiedErrorId = $null
-          }
-          try {
-            Get-Acl -LiteralPath $ProbePath -ErrorAction Stop | Out-Null
-            $getAclResult.success = $true
-          } catch {
-            $getAclResult.errorType = $_.Exception.GetType().FullName
-            $getAclResult.fullyQualifiedErrorId = $_.FullyQualifiedErrorId
-          }
-
-          [ordered]@{
-            mode = $Mode
-            psVersion = $PSVersionTable.PSVersion.ToString()
-            psEdition = $PSVersionTable.PSEdition
-            psHome = $PSHOME
-            psModulePath = $env:PSModulePath
-            winPsModulePath = $env:WinPSModulePath
-            getAclCommand = Convert-CommandSummary
-            getAclCommandAll = Convert-CommandSummary -All
-            securityModules = $candidateSummaries
-            absoluteManifest = $absoluteManifestCheck
-            import = $importResult
-            getAcl = $getAclResult
-          } | ConvertTo-Json -Depth 10 -Compress
-          '@ | Set-Content -LiteralPath $childScript -Encoding utf8
-
-          function Invoke-DirectProbe {
-            param([string]$Mode)
-            $output = & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-              -File $childScript -ProbePath $probePath -Mode $Mode 2>&1
-            [ordered]@{
-              exitCode = $LASTEXITCODE
-              output = ($output -join "`n")
-            }
-          }
-
-          '=== direct powershell.exe with inherited environment ==='
-          Invoke-DirectProbe -Mode standard | ConvertTo-Json -Depth 4
-          '=== direct powershell.exe with absolute manifest import ==='
-          Invoke-DirectProbe -Mode absolute-manifest | ConvertTo-Json -Depth 4
-
-          $nodeScript = Join-Path $diagnosticRoot 'probe-node-to-windows-powershell.mjs'
-          @'
-          import { spawnSync } from 'node:child_process';
-
-          const [childScript, probePath] = process.argv.slice(2);
-
-          function findEnvironmentKey(env, expectedName) {
-            return Object.keys(env).find(
-              (key) => key.toLowerCase() === expectedName.toLowerCase(),
-            );
-          }
-
-          function runCondition(name, mutateEnvironment) {
-            const env = { ...process.env };
-            const state = mutateEnvironment(env);
-            if (state?.skipped) {
-              return { condition: name, skipped: true, reason: state.reason };
-            }
-            const result = spawnSync(
-              'powershell.exe',
-              [
-                '-NoLogo',
-                '-NoProfile',
-                '-NonInteractive',
-                '-ExecutionPolicy',
-                'Bypass',
-                '-File',
-                childScript,
-                '-ProbePath',
-                probePath,
-                '-Mode',
-                'standard',
-              ],
-              { env, encoding: 'utf8', windowsHide: true },
-            );
-            return {
-              condition: name,
-              skipped: false,
-              exitCode: result.status,
-              spawnError: result.error
-                ? { name: result.error.name, code: result.error.code }
-                : null,
-              stdout: result.stdout.trim(),
-              stderr: result.stderr.trim(),
-            };
-          }
-
-          const results = [
-            runCondition('A_INHERITED_PROCESS_ENV', () => ({})),
-            runCondition('B_PSModulePath_EQUALS_WinPSModulePath', (env) => {
-              const winPsModulePathKey = findEnvironmentKey(env, 'WinPSModulePath');
-              if (!winPsModulePathKey || !env[winPsModulePathKey]) {
-                return { skipped: true, reason: 'WinPSModulePath is not present; no value was synthesized.' };
-              }
-              const psModulePathKey = findEnvironmentKey(env, 'PSModulePath') ?? 'PSModulePath';
-              env[psModulePathKey] = env[winPsModulePathKey];
-              return {};
-            }),
-            runCondition('C_PSModulePath_REMOVED', (env) => {
-              const psModulePathKey = findEnvironmentKey(env, 'PSModulePath');
-              if (psModulePathKey) delete env[psModulePathKey];
-              return {};
-            }),
-          ];
-
-          process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
-          '@ | Set-Content -LiteralPath $nodeScript -Encoding utf8
-
-          '=== node to powershell.exe A/B/C ==='
-          node $nodeScript $childScript $probePath
-
       - name: Run native protocol, integration, and PowerShell parity tests
         working-directory: wp-builder
         shell: pwsh
         run: node --test test/security/windows-native-inspector-protocol.test.mjs test/security/windows-native-inspector.integration.test.mjs test/security/windows-inspector-parity.test.mjs
+
+      - name: Run experimental ReplaceFileW characterization
+        working-directory: wp-builder
+        shell: pwsh
+        env:
+          WPB_RUN_WINDOWS_REPLACE_CHARACTERIZATION: "1"
+        run: node --test --test-name-pattern "Experimental ReplaceFileW characterization" test/security/windows-native-inspector.integration.test.mjs
 
       - name: Run security test suites
         working-directory: wp-builder

@@ -16,11 +16,22 @@ import {
 import { resolveWindowsNativeInspectorTestPath } from '../helpers/windows-native-inspector-path.mjs';
 
 const helperPath = resolveWindowsNativeInspectorTestPath();
+const experimentalHelperPath = resolveWindowsNativeInspectorTestPath(
+    process.env,
+    'WPB_TEST_WINDOWS_REPLACE_INSPECTOR_PATH'
+);
 const integrationOptions = process.platform !== 'win32'
     ? { skip: 'Windows-only native inspector integration fixture.' }
     : !fs.existsSync(helperPath)
         ? { skip: `Native inspector binary is not built: ${helperPath}` }
         : {};
+const experimentalIntegrationOptions = process.env.WPB_RUN_WINDOWS_REPLACE_CHARACTERIZATION !== '1'
+    ? { skip: 'Experimental ReplaceFileW characterization is not enabled.' }
+    : process.platform !== 'win32'
+        ? { skip: 'Windows-only experimental ReplaceFileW characterization.' }
+        : !fs.existsSync(experimentalHelperPath)
+            ? { skip: `Experimental native helper binary is not built: ${experimentalHelperPath}` }
+            : {};
 
 test('test-only helper override canonicalizes a regular file inside RUNNER_TEMP', t => {
     const runnerTemp = createTempWorkspace(t, 'windows-helper-path');
@@ -154,8 +165,8 @@ function inspectRaw(file, requestId = 'raw-leak-check') {
     return { response, output };
 }
 
-function runRawRequest(request, env = process.env) {
-    const result = spawnSync(helperPath, [], {
+function runRawRequest(request, env = process.env, executable = helperPath) {
+    const result = spawnSync(executable, [], {
         input: JSON.stringify(request),
         encoding: 'utf8',
         windowsHide: true,
@@ -233,6 +244,47 @@ function reportSafeValidation(fixture, response) {
     console.log(`WPB_VALIDATION ${fixture} ${sanitized}`);
 }
 
+function assertKnownInheritedDaclLimitation(fixture, result) {
+    reportSafeValidation(fixture, result.response);
+    assert.equal(result.status, 2, JSON.stringify(result.response));
+    assert.equal(result.response.error.code, 'WINDOWS_RECOVERY_REQUIRED');
+    const forwardTarget = result.response.validation.find(item => (
+        item.stage === 'post-replace' && item.subject === 'target'
+    ));
+    const backup = result.response.validation.find(item => (
+        item.stage === 'post-replace' && item.subject === 'backup'
+    ));
+    const rollbackTarget = result.response.validation.find(item => (
+        item.stage === 'post-rollback' && item.subject === 'target'
+    ));
+    for (const item of [forwardTarget, rollbackTarget]) {
+        assert.ok(item, `${fixture}: inherited DACL target diagnostic is missing`);
+        assert.equal(item.daclAutoInheritedMatches, false);
+        assert.equal(item.daclMatches, false);
+        assert.equal(item.metadataFingerprintMatches, false);
+        for (const field of [
+            'daclPresentMatches',
+            'daclNullMatches',
+            'protectedAclMatches',
+            'daclAutoInheritRequiredMatches',
+            'daclRevisionMatches',
+            'aceCountMatches',
+            'explicitAceCountMatches',
+            'inheritedAceCountMatches',
+            'aceOrderDigestMatches',
+            'semanticAceSetDigestMatches',
+            'accessMaskDigestMatches',
+            'inheritanceFlagsDigestMatches',
+            'trusteeDigestMatches',
+            'aceSemanticsCompleteMatches'
+        ]) assert.equal(item[field], true, `${fixture}: ${field}`);
+    }
+    assert.ok(backup, `${fixture}: exact recovery backup diagnostic is missing`);
+    for (const field of validationBooleanFields) {
+        assert.equal(backup[field], true, `${fixture}: backup ${field}`);
+    }
+}
+
 function replaceEndpoint(file, response = inspect(file)) {
     return {
         path: path.resolve(file),
@@ -276,7 +328,7 @@ test('built helper trust manifest is valid for inspect and ineligible for replac
     assert.ok(result.replaceBlockingReasons.some(reason => reason.code === 'WINDOWS_HELPER_REPLACE_INCOMPLETE'));
 });
 
-test('real helper accepts protocol v2 inspect and rejects incomplete replace requests', integrationOptions, () => {
+test('release helper accepts protocol v2 inspect and rejects replace requests', integrationOptions, () => {
     const root = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'wpb-protocol-v2-'));
     const file = path.join(root, 'case.php');
     fs.writeFileSync(file, '<?php echo 1; ?>');
@@ -301,7 +353,7 @@ test('real helper accepts protocol v2 inspect and rejects incomplete replace req
         assert.equal(replaceResult.status, 2);
         assert.equal(replaceResult.response.ok, false);
         assert.equal(replaceResult.response.operation, 'replace');
-        assert.equal(replaceResult.response.error.code, 'INSPECTION_FAILED');
+        assert.equal(replaceResult.response.error.code, 'OPERATION_UNSUPPORTED');
 
         const unsupported = runRawRequest({
             schemaVersion: 2,
@@ -440,7 +492,7 @@ test('Windows native inspector real filesystem fixtures', integrationOptions, as
     });
 });
 
-test('Windows native helper ReplaceFileW transaction fixtures', integrationOptions, async t => {
+test('Experimental ReplaceFileW characterization', experimentalIntegrationOptions, async t => {
     const root = createTempWorkspace(t, 'windows-native-replace');
     const files = name => ({
         target: writeTempFile(root, `${name}-target.php`, `original-${name}`),
@@ -454,39 +506,25 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
             fixture.backup,
             options.requestId
         );
-        return runRawRequest(request, options.env ?? process.env);
+        return runRawRequest(request, options.env ?? process.env, experimentalHelperPath);
     };
 
-    await t.test('normal ReplaceFileW commits replacement identity and removes backup', () => {
+    await t.test('normal inherited DACL remains unsupported after restore and rollback', () => {
         const fixture = files('normal');
-        const beforeTarget = inspect(fixture.target);
-        const beforeReplacement = inspect(fixture.replacement);
+        const original = fs.readFileSync(fixture.target);
         const result = runReplace(fixture);
-        reportSafeValidation('normal-replace', result.response);
-        assert.equal(result.status, 0, JSON.stringify(result.response));
-        assert.equal(result.response.transaction.state, 'COMMITTED');
-        assert.equal(result.response.transaction.replaceFileFlags, 0);
-        assert.equal(result.response.transaction.backupRemoved, true);
-        assert.equal(fs.readFileSync(fixture.target, 'utf8'), 'desired-normal');
-        assert.equal(fs.existsSync(fixture.replacement), false);
+        assertKnownInheritedDaclLimitation('normal-replace', result);
+        assert.deepEqual(fs.readFileSync(fixture.target), original);
         assert.equal(fs.existsSync(fixture.backup), false);
-        const after = inspect(fixture.target);
-        assert.deepEqual(after.file.identity, beforeReplacement.file.identity);
-        assert.equal(after.security.ownerFingerprint, beforeTarget.security.ownerFingerprint);
-        assert.equal(after.security.groupFingerprint, beforeTarget.security.groupFingerprint);
-        assert.equal(after.security.daclFingerprint, beforeTarget.security.daclFingerprint);
+        assert.equal(fs.existsSync(fixture.replacement), true);
     });
 
-    await t.test('inherited ACL is preserved', () => {
+    await t.test('inherited ACL ACE semantics restore but control state remains unsupported', () => {
         const fixture = files('inherited');
         const before = inspect(fixture.target);
         assert.equal(before.security.daclProtected, false);
         const result = runReplace(fixture);
-        reportSafeValidation('inherited-acl', result.response);
-        assert.equal(result.status, 0, JSON.stringify(result.response));
-        const after = inspect(fixture.target);
-        assert.equal(after.security.daclFingerprint, before.security.daclFingerprint);
-        assert.equal(after.security.daclProtected, false);
+        assertKnownInheritedDaclLimitation('inherited-acl', result);
     });
 
     await t.test('protected explicit ACL is preserved', () => {
@@ -512,8 +550,7 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         if (setup.status !== 0) return t.skip('The runner account cannot create an Administrators-owned fixture.');
         const before = inspect(fixture.target);
         const result = runReplace(fixture);
-        reportSafeValidation('administrators-owner', result.response);
-        assert.equal(result.status, 0, JSON.stringify(result.response));
+        assertKnownInheritedDaclLimitation('administrators-owner', result);
         assert.equal(inspect(fixture.target).security.ownerFingerprint, before.security.ownerFingerprint);
     });
 
@@ -522,8 +559,8 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         fs.writeFileSync(`${fixture.target}:wpb-phase-b`, 'sensitive-stream-value');
         const before = inspect(fixture.target);
         const result = runReplace(fixture);
-        reportSafeValidation('ads', result.response);
-        assert.equal(result.status, 0, JSON.stringify(result.response));
+        assertKnownInheritedDaclLimitation('ads', result);
+        assert.ok(result.response.validation.every(item => item.adsMatches));
         const after = inspect(fixture.target);
         assert.equal(after.streams.count, 1);
         assert.equal(after.streams.digest, before.streams.digest);
@@ -536,8 +573,8 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         assert.equal(setup.status, 0, setup.stderr);
         const before = inspect(fixture.target);
         const result = runReplace(fixture);
-        reportSafeValidation('hidden-attribute', result.response);
-        assert.equal(result.status, 0, JSON.stringify(result.response));
+        assertKnownInheritedDaclLimitation('hidden-attribute', result);
+        assert.ok(result.response.validation.every(item => item.attributesMatch));
         assert.equal(inspect(fixture.target).file.attributes, before.file.attributes);
         assert.equal(powershell(`if ((Get-Item -LiteralPath ${psQuote(fixture.target)} -Force).Attributes -band [IO.FileAttributes]::Hidden) { exit 0 } else { exit 1 }`).status, 0);
     });
@@ -552,7 +589,11 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
             if (result.status === 0) {
                 assert.equal(inspect(fixture.target).file.readonly, true);
             } else {
-                assert.equal(result.response.error.code, 'WINDOWS_REPLACE_FAILED');
+                assert.ok([
+                    'WINDOWS_REPLACE_FAILED',
+                    'WINDOWS_RECOVERY_REQUIRED'
+                ].includes(result.response.error.code));
+                if (result.response.validation) reportSafeValidation('readonly-replace', result.response);
                 assert.deepEqual(fs.readFileSync(fixture.target), original);
             }
         } finally {
@@ -642,13 +683,11 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         const result = runReplace(fixture, {
             env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'final-hash-mismatch' }
         });
-        reportSafeValidation('rollback-after-hash-fault', result.response);
-        assert.equal(result.status, 2);
-        assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
+        assertKnownInheritedDaclLimitation('rollback-after-hash-fault', result);
         assert.deepEqual(fs.readFileSync(fixture.target), original);
         assert.deepEqual(inspect(fixture.target).file.identity, originalIdentity);
         assert.equal(fs.existsSync(fixture.backup), false);
-        assert.equal(fs.existsSync(fixture.replacement), false);
+        assert.equal(fs.existsSync(fixture.replacement), true);
     });
 
     await t.test('final metadata mismatch triggers validated rollback', () => {
@@ -657,11 +696,11 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         const result = runReplace(fixture, {
             env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'final-metadata-mismatch' }
         });
-        reportSafeValidation('rollback-after-metadata-fault', result.response);
-        assert.equal(result.status, 2);
-        assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
+        assertKnownInheritedDaclLimitation('rollback-after-metadata-fault', result);
         const after = inspect(fixture.target);
-        assert.equal(after.metadataFingerprint, before.metadataFingerprint);
+        assert.notEqual(after.metadataFingerprint, before.metadataFingerprint);
+        const rollbackDiagnostic = result.response.validation.find(item => item.stage === 'post-rollback');
+        assert.equal(rollbackDiagnostic.attributesMatch, true);
     });
 
     await t.test('DACL restoration failure rolls back only after complete metadata restoration', () => {
@@ -671,11 +710,9 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         const result = runReplace(fixture, {
             env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'dacl-restoration-failure' }
         });
-        reportSafeValidation('dacl-restoration-failure', result.response);
-        assert.equal(result.status, 2);
-        assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
+        assertKnownInheritedDaclLimitation('dacl-restoration-failure', result);
         assert.deepEqual(fs.readFileSync(fixture.target), original);
-        assert.equal(inspect(fixture.target).metadataFingerprint, before.metadataFingerprint);
+        assert.notEqual(inspect(fixture.target).metadataFingerprint, before.metadataFingerprint);
     });
 
     await t.test('attribute restoration failure rolls back only after complete metadata restoration', () => {
@@ -685,11 +722,9 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         const result = runReplace(fixture, {
             env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'attribute-restoration-failure' }
         });
-        reportSafeValidation('attribute-restoration-failure', result.response);
-        assert.equal(result.status, 2);
-        assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
+        assertKnownInheritedDaclLimitation('attribute-restoration-failure', result);
         assert.deepEqual(fs.readFileSync(fixture.target), original);
-        assert.equal(inspect(fixture.target).metadataFingerprint, before.metadataFingerprint);
+        assert.notEqual(inspect(fixture.target).metadataFingerprint, before.metadataFingerprint);
     });
 
     await t.test('rollback restoration failure remains recovery-required', () => {
@@ -718,16 +753,18 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
 
     await t.test('replace responses do not leak paths or security metadata', () => {
         const fixture = files('leak');
-        const result = spawnSync(helperPath, [], {
+        const result = spawnSync(experimentalHelperPath, [], {
             input: JSON.stringify(replaceRequest(fixture.target, fixture.replacement, fixture.backup)),
             encoding: 'utf8',
             windowsHide: true
         });
-        assert.equal(result.status, 0, result.stdout);
+        assert.equal(result.status, 2, result.stdout);
         assert.equal(result.stderr, '');
         assert.equal(result.stdout.includes(root), false);
         assert.doesNotMatch(result.stdout, /S-\d+(?:-\d+){1,}/);
         assert.doesNotMatch(result.stdout, /(?:^|[,\{\s])(?:O|G|D|S):(?:AI|AR|P|\()/);
-        reportSafeValidation('raw-leak', JSON.parse(result.stdout));
+        const response = JSON.parse(result.stdout);
+        assert.equal(response.error.code, 'WINDOWS_RECOVERY_REQUIRED');
+        reportSafeValidation('raw-leak', response);
     });
 });

@@ -27,6 +27,22 @@ test('eligible PHP matrix runtime completes one apply smoke', {
 
     assert.equal(plan.tokenizer.runtime.gate.status, 'VERIFIED_APPLY_CANDIDATE');
     assert.equal(plan.lint.passed, true, plan.lint.output);
+    if (process.platform === 'win32') {
+        assert.equal(plan.canApply, false);
+        assert.ok(plan.blockingReasons.some(
+            reason => reason.code === 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
+        ));
+        await assert.rejects(
+            () => applySecurityFixPlan({ ...plan, canApply: true }, { assumeYes: true }),
+            error => (
+                error.exitCode === 2 &&
+                error.code === 'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
+            )
+        );
+        assert.deepEqual(fs.readFileSync(file), plan.originalBytes);
+        assertNoSecurityArtifacts(root);
+        return;
+    }
     assert.equal(plan.canApply, true, JSON.stringify(plan.blockingReasons));
     const result = await applySecurityFixPlan(plan, { assumeYes: true });
     assert.equal(result.status, 'applied');

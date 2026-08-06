@@ -9,7 +9,9 @@ import {
 } from './fix-plan.js';
 import {
     metadataCanReplace,
-    metadataSnapshotsMatch
+    metadataSnapshotsMatch,
+    WINDOWS_APPLY_UNSUPPORTED_CODE,
+    WINDOWS_APPLY_UNSUPPORTED_MESSAGE
 } from './metadata.js';
 import {
     LinuxRollbackError,
@@ -105,6 +107,12 @@ export async function applySecurityFixPlan(plan, options = {}) {
         fileSystem = fs,
         takeSnapshot = takeSecurityFileSnapshot
     } = options;
+
+    if (plan?.snapshot?.metadata?.platform === 'win32') throw new SecurityApplyError(
+        WINDOWS_APPLY_UNSUPPORTED_MESSAGE,
+        2,
+        WINDOWS_APPLY_UNSUPPORTED_CODE
+    );
 
     if (!plan.canApply) throw new SecurityApplyError(
         'This Security Fix Plan is blocked. No files were changed.',

@@ -32,7 +32,56 @@ async function expectApplyError(action, exitCode, code) {
     });
 }
 
-test('Security Fix Apply safety matrix', securityFixIntegrationTestOptions(), async t => {
+const applySafetyOptions = process.platform === 'win32'
+    ? { skip: 'Windows apply is unsupported by the strict metadata contract.' }
+    : securityFixIntegrationTestOptions();
+
+test('Windows applier guard rejects a forged apply-capable Plan before artifacts exist', async t => {
+    const fixture = createPlan(t, 'apply-windows-guard');
+    const before = fs.readFileSync(fixture.file);
+    const beforeStat = fs.statSync(fixture.file);
+    const beforeSnapshot = takeSecurityFileSnapshot(fixture.file);
+    const forgedPlan = {
+        ...fixture.plan,
+        canApply: true,
+        snapshot: {
+            ...fixture.plan.snapshot,
+            metadata: {
+                ...fixture.plan.snapshot.metadata,
+                platform: 'win32',
+                capability: {
+                    inspectable: true,
+                    reproducible: true,
+                    blockingReasons: []
+                }
+            }
+        }
+    };
+    const fileSystem = new Proxy({}, {
+        get() {
+            throw new Error('The Windows guard must run before filesystem access.');
+        }
+    });
+
+    await expectApplyError(
+        () => applySecurityFixPlan(forgedPlan, { assumeYes: true, fileSystem }),
+        2,
+        'WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA'
+    );
+    assert.deepEqual(fs.readFileSync(fixture.file), before);
+    const afterStat = fs.statSync(fixture.file);
+    assert.equal(afterStat.ino, beforeStat.ino);
+    assert.equal(afterStat.dev, beforeStat.dev);
+    const afterSnapshot = takeSecurityFileSnapshot(fixture.file);
+    assert.equal(afterSnapshot.hash, beforeSnapshot.hash);
+    assert.equal(
+        afterSnapshot.metadata.securityFingerprint,
+        beforeSnapshot.metadata.securityFingerprint
+    );
+    assertNoSecurityArtifacts(fixture.root);
+});
+
+test('Security Fix Apply safety matrix', applySafetyOptions, async t => {
     await t.test('apply success', async st => {
         const fixture = createPlan(st, 'apply-success');
         const result = await applySecurityFixPlan(fixture.plan, { assumeYes: true });

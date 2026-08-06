@@ -11,11 +11,14 @@ function isInside(parent, target) {
     );
 }
 
-export function resolveWindowsNativeInspectorTestPath(env = process.env) {
-    const configuredPath = env.WPB_TEST_WINDOWS_INSPECTOR_PATH;
+export function resolveWindowsNativeInspectorTestPath(
+    env = process.env,
+    variableName = 'WPB_TEST_WINDOWS_INSPECTOR_PATH'
+) {
+    const configuredPath = env[variableName];
     if (!configuredPath) return getBundledWindowsInspectorPath();
     if (!path.isAbsolute(configuredPath)) {
-        throw new Error('WPB_TEST_WINDOWS_INSPECTOR_PATH must be an absolute path.');
+        throw new Error(`${variableName} must be an absolute path.`);
     }
 
     const runnerTemp = env.RUNNER_TEMP;
@@ -25,13 +28,13 @@ export function resolveWindowsNativeInspectorTestPath(env = process.env) {
 
     const helperStat = fs.lstatSync(configuredPath);
     if (!helperStat.isFile() || helperStat.isSymbolicLink()) {
-        throw new Error('WPB_TEST_WINDOWS_INSPECTOR_PATH must identify a regular, non-symlink file.');
+        throw new Error(`${variableName} must identify a regular, non-symlink file.`);
     }
 
     const realRunnerTemp = fs.realpathSync.native(runnerTemp);
     const realHelperPath = fs.realpathSync.native(configuredPath);
     if (!isInside(realRunnerTemp, realHelperPath)) {
-        throw new Error('WPB_TEST_WINDOWS_INSPECTOR_PATH must be inside RUNNER_TEMP.');
+        throw new Error(`${variableName} must be inside RUNNER_TEMP.`);
     }
     return realHelperPath;
 }
