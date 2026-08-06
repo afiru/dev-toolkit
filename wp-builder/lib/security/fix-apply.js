@@ -7,6 +7,22 @@ import {
     sha256,
     takeSecurityFileSnapshot
 } from './fix-plan.js';
+import {
+    metadataCanReplace,
+    metadataSnapshotsMatch
+} from './metadata.js';
+import {
+    LinuxRollbackError,
+    assertLinuxFinalSnapshot,
+    assertLinuxRollbackPathAvailable,
+    cleanupLinuxRollbackBeforeRename,
+    createLinuxRollbackBackup,
+    fsyncLinuxDirectory,
+    linuxRollbackPath,
+    revalidateLinuxTransaction,
+    removeLinuxRollbackBackup,
+    rollbackLinuxTarget
+} from './linux-rollback.js';
 
 export class SecurityApplyError extends Error {
     constructor(message, exitCode = 1, code = 'SECURITY_APPLY_ERROR') {
@@ -24,7 +40,8 @@ function snapshotsMatch(expected, current) {
         expected.normalFile === current.normalFile &&
         expected.symlink === current.symlink &&
         expected.size === current.size &&
-        expected.hash === current.hash
+        expected.hash === current.hash &&
+        metadataSnapshotsMatch(expected.metadata, current.metadata)
     );
 }
 
@@ -68,6 +85,16 @@ function asAtomicError(error, action) {
     );
 }
 
+function asSecurityApplyError(error) {
+    if (error instanceof SecurityApplyError) return error;
+    if (error instanceof LinuxRollbackError) {
+        const result = new SecurityApplyError(error.message, error.exitCode, error.code);
+        result.details = error.details;
+        return result;
+    }
+    return error;
+}
+
 export async function applySecurityFixPlan(plan, options = {}) {
     const {
         assumeYes = false,
@@ -84,6 +111,15 @@ export async function applySecurityFixPlan(plan, options = {}) {
         2,
         'PLAN_BLOCKED'
     );
+    const linuxRollbackEnabled = plan.snapshot.metadata?.platform === 'linux';
+    const rollbackPath = linuxRollbackEnabled ? linuxRollbackPath(plan.targetPath) : null;
+    if (linuxRollbackEnabled) {
+        try {
+            await assertLinuxRollbackPathAvailable(fileSystem, rollbackPath);
+        } catch (error) {
+            throw asSecurityApplyError(error);
+        }
+    }
     if (!plan.hasChanges) return { status: 'no_changes' };
 
     if (!assumeYes) {
@@ -103,6 +139,7 @@ export async function applySecurityFixPlan(plan, options = {}) {
     let lockHandle;
     let tempHandle;
     let ownsLock = false;
+    let rollbackCreated = false;
 
     try {
         try {
@@ -124,10 +161,20 @@ export async function applySecurityFixPlan(plan, options = {}) {
         }
 
         assertSnapshotCurrent(plan, takeSnapshot);
+        if (linuxRollbackEnabled) {
+            try {
+                await assertLinuxRollbackPathAvailable(fileSystem, rollbackPath);
+            } catch (error) {
+                throw asSecurityApplyError(error);
+            }
+        }
 
         try {
             tempHandle = await fileSystem.open(tempPath, 'wx');
             await tempHandle.writeFile(plan.desiredBytes);
+            if (plan.snapshot.metadata.platform !== 'win32') {
+                await tempHandle.chmod(plan.snapshot.metadata.stat.mode & 0o777);
+            }
             await tempHandle.sync();
             await tempHandle.close();
             tempHandle = null;
@@ -145,6 +192,13 @@ export async function applySecurityFixPlan(plan, options = {}) {
             'Temporary Security Fix file failed hash validation.',
             6,
             'TEMP_HASH_MISMATCH'
+        );
+
+        const tempSnapshot = takeSecurityFileSnapshot(tempPath);
+        if (!metadataCanReplace(plan.snapshot.metadata, tempSnapshot.metadata)) throw new SecurityApplyError(
+            'Temporary Security Fix file cannot reproduce the target metadata safely.',
+            2,
+            'METADATA_UNSAFE'
         );
 
         const tempLint = lintPhpBytes(null, {
@@ -167,24 +221,126 @@ export async function applySecurityFixPlan(plan, options = {}) {
         // Immediate pre-rename stale check. Keep this separate so the safety contract is explicit.
         assertSnapshotCurrent(plan, takeSnapshot);
 
+        if (linuxRollbackEnabled) {
+            try {
+                await createLinuxRollbackBackup({
+                    fileSystem,
+                    targetPath: plan.targetPath,
+                    rollbackPath,
+                    originalSnapshot: plan.snapshot,
+                    takeSnapshot
+                });
+                rollbackCreated = true;
+                // Keep this as a separate immediate check. nlink === 2 is the
+                // expected transaction state after our own hard-link backup.
+                await revalidateLinuxTransaction({
+                    targetPath: plan.targetPath,
+                    rollbackPath,
+                    originalSnapshot: plan.snapshot,
+                    takeSnapshot
+                });
+            } catch (error) {
+                if (rollbackCreated) {
+                    try {
+                        await cleanupLinuxRollbackBeforeRename({
+                            fileSystem,
+                            targetPath: plan.targetPath,
+                            rollbackPath,
+                            directoryPath: directory,
+                            originalSnapshot: plan.snapshot,
+                            takeSnapshot
+                        });
+                        rollbackCreated = false;
+                    } catch (cleanupError) {
+                        throw asSecurityApplyError(cleanupError);
+                    }
+                }
+                throw asSecurityApplyError(error);
+            }
+        }
+
         try {
             await fileSystem.rename(tempPath, plan.targetPath);
         } catch (error) {
+            if (linuxRollbackEnabled && rollbackCreated) {
+                try {
+                    await cleanupLinuxRollbackBeforeRename({
+                        fileSystem,
+                        targetPath: plan.targetPath,
+                        rollbackPath,
+                        directoryPath: directory,
+                        originalSnapshot: plan.snapshot,
+                        takeSnapshot
+                    });
+                    rollbackCreated = false;
+                } catch (cleanupError) {
+                    throw asSecurityApplyError(cleanupError);
+                }
+            }
             throw asAtomicError(error, 'atomic replace');
         }
 
-        let finalBytes;
-        try {
-            finalBytes = await fileSystem.readFile(plan.targetPath);
-        } catch (error) {
-            throw asAtomicError(error, 'final validation read');
-        }
-        if (sha256(finalBytes) !== plan.desiredHash) throw new SecurityApplyError(
-            'Applied Security Fix file failed final hash validation.',
-            6,
-            'FINAL_HASH_MISMATCH'
-        );
+        if (linuxRollbackEnabled) {
+            let finalFailure = null;
+            try {
+                await fsyncLinuxDirectory(fileSystem, directory);
+                const finalSnapshot = takeSnapshot(plan.targetPath);
+                assertLinuxFinalSnapshot(
+                    plan.snapshot,
+                    tempSnapshot,
+                    finalSnapshot,
+                    plan.desiredHash,
+                    plan.desiredBytes.length
+                );
+            } catch (error) {
+                finalFailure = error;
+            }
 
+            if (finalFailure) {
+                try {
+                    await rollbackLinuxTarget({
+                        fileSystem,
+                        targetPath: plan.targetPath,
+                        rollbackPath,
+                        directoryPath: directory,
+                        originalSnapshot: plan.snapshot,
+                        takeSnapshot
+                    });
+                    rollbackCreated = false;
+                } catch (rollbackError) {
+                    throw asSecurityApplyError(rollbackError);
+                }
+                throw new SecurityApplyError(
+                    `Security Fix final validation failed and the original file was restored: ${finalFailure.message}`,
+                    6,
+                    'FINAL_VALIDATION_FAILED_ROLLED_BACK'
+                );
+            }
+
+            try {
+                await removeLinuxRollbackBackup({
+                    fileSystem,
+                    rollbackPath,
+                    directoryPath: directory
+                });
+                rollbackCreated = false;
+            } catch (error) {
+                throw asSecurityApplyError(error);
+            }
+        } else {
+            // Preserve the existing Windows apply and final-validation semantics.
+            let finalBytes;
+            try {
+                finalBytes = await fileSystem.readFile(plan.targetPath);
+            } catch (error) {
+                throw asAtomicError(error, 'final validation read');
+            }
+            if (sha256(finalBytes) !== plan.desiredHash) throw new SecurityApplyError(
+                'Applied Security Fix file failed final hash validation.',
+                6,
+                'FINAL_HASH_MISMATCH'
+            );
+        }
         return {
             status: 'applied',
             path: plan.targetPath,

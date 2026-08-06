@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { normalizePhpRuntimeContract } from './php-runtime-contract.js';
 
 const TOKENIZER_PATH = fileURLToPath(new URL('./php-tokenizer.php', import.meta.url));
 const ESCAPE_FUNCTIONS = new Set([
@@ -120,6 +121,26 @@ function inlineHtmlAfter(tokens, closeIndex) {
     return '';
 }
 
+function hasEarlierPhpIslandInQuotedAttribute(tokens, openIndex, attributeName, quote) {
+    let attributeStartIndex = -1;
+    for (let index = openIndex - 1; index >= 0; index -= 1) {
+        if (tokens[index].type !== 'T_INLINE_HTML') continue;
+        const clean = stripCompleteHtmlComments(tokens[index].text);
+        const attribute = clean.match(/(?:^|\s)([A-Za-z_:][A-Za-z0-9_:.-]*)\s*=\s*(["'])$/);
+        if (attribute?.[1].toLowerCase() === attributeName && attribute[2] === quote) {
+            attributeStartIndex = index;
+            break;
+        }
+    }
+
+    // The combined HTML looked like a quoted attribute, but its opening boundary
+    // could not be tied to one inline-HTML token. Fail closed instead of guessing.
+    if (attributeStartIndex === -1) return true;
+    return tokens
+        .slice(attributeStartIndex + 1, openIndex)
+        .some(token => token.type === 'T_OPEN_TAG' || token.type === 'T_OPEN_TAG_WITH_ECHO');
+}
+
 function determineHtmlContext(tokens, openIndex, closeIndex) {
     const before = inlineHtmlBefore(tokens, openIndex);
     const after = inlineHtmlAfter(tokens, closeIndex);
@@ -155,6 +176,12 @@ function determineHtmlContext(tokens, openIndex, closeIndex) {
         };
 
         const attributeName = attribute[1].toLowerCase();
+        if (hasEarlierPhpIslandInQuotedAttribute(tokens, openIndex, attributeName, attribute[2])) return {
+            kind: 'MULTIPLE_PHP_ISLAND_ATTRIBUTE',
+            confidence: 'HIGH',
+            attributeName,
+            reason: `Attribute ${attributeName} is composed from multiple PHP islands.`
+        };
         if (attributeName === 'srcset') return {
             kind: 'SRCSET_ATTRIBUTE',
             confidence: 'HIGH',
@@ -260,6 +287,8 @@ function parseTokenizerOutput(result) {
     if (result.error?.code === 'ENOENT') return {
         ok: false,
         unavailable: true,
+        errorCode: 'PHP_TOKENIZER_UNAVAILABLE',
+        runtime: null,
         message: 'PHP runtime is unavailable.'
     };
     let parsed;
@@ -269,16 +298,33 @@ function parseTokenizerOutput(result) {
         return {
             ok: false,
             unavailable: false,
+            errorCode: 'PHP_TOKENIZER_CONTRACT_UNSAFE',
+            runtime: null,
             message: result.stderr || 'PHP tokenizer returned invalid output.'
         };
     }
-    if (!parsed.ok) return {
+
+    const contract = normalizePhpRuntimeContract(parsed.runtime);
+    if (!contract.ok) return {
         ok: false,
         unavailable: false,
+        errorCode: contract.code,
+        runtime: contract.runtime,
+        message: contract.message
+    };
+
+    if (!parsed.ok) return {
+        ok: false,
+        unavailable: parsed.error?.code === 'PHP_TOKENIZER_UNAVAILABLE',
+        errorCode: parsed.error?.code ?? 'WPB-SCF-PARSE-UNSAFE',
+        runtime: contract.runtime,
         message: parsed.error?.message || 'PHP tokenizer rejected the file.',
         line: parsed.error?.line ?? null
     };
-    return parsed;
+    return {
+        ...parsed,
+        runtime: contract.runtime
+    };
 }
 
 export function runPhpTokenizer(bytes, options = {}) {
@@ -292,6 +338,9 @@ export function runPhpTokenizer(bytes, options = {}) {
 }
 
 function makeParseUnsafeFinding(filePath, bytes, tokenizerResult) {
+    const runtimeNote = tokenizerResult.errorCode === 'WPB-SCF-PARSE-UNSAFE' && tokenizerResult.runtime?.phpVersion
+        ? ` Runtime PHP ${tokenizerResult.runtime.phpVersion}; the file may use syntax introduced by a newer PHP version.`
+        : '';
     return {
         id: 'finding-0001',
         file: filePath,
@@ -310,7 +359,7 @@ function makeParseUnsafeFinding(filePath, bytes, tokenizerResult) {
         proposedEscape: null,
         confidence: 'LOW',
         autoFixable: false,
-        reason: tokenizerResult.message,
+        reason: `${tokenizerResult.message}${runtimeNote}`,
         replacement: null
     };
 }
@@ -321,7 +370,9 @@ export function analyzeSecurityFile({ filePath, bytes, phpCommand, tokenizerPath
         tokenizer: {
             available: !tokenizer.unavailable,
             ok: false,
-            error: tokenizer.message
+            error: tokenizer.message,
+            errorCode: tokenizer.errorCode,
+            runtime: tokenizer.runtime
         },
         findings: [makeParseUnsafeFinding(filePath, bytes, tokenizer)],
         canAnalyze: false
@@ -439,7 +490,13 @@ export function analyzeSecurityFile({ filePath, bytes, phpCommand, tokenizerPath
     }
 
     return {
-        tokenizer: { available: true, ok: true, error: null },
+        tokenizer: {
+            available: true,
+            ok: true,
+            error: null,
+            errorCode: null,
+            runtime: tokenizer.runtime
+        },
         findings,
         canAnalyze: true
     };

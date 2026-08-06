@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { buildSecurityFixPlan } from '../../lib/security/fix-plan.js';
-import { phpIntegrationTestOptions } from '../helpers/php-runtime.mjs';
+import { securityFixIntegrationTestOptions } from '../helpers/php-runtime.mjs';
 import { createTempWorkspace, writeTempFile } from '../helpers/temp-workspace.mjs';
 
 const bom = Buffer.from([0xef, 0xbb, 0xbf]);
@@ -15,7 +15,7 @@ const cases = [
     ['multibyte', Buffer.from("<p>日本語 <?= SCF::get('field') ?> 終了</p>\n"), 'LF', false, true]
 ];
 
-test('Security Fix Plan preserves bytes outside replacement ranges', phpIntegrationTestOptions(), async t => {
+test('Security Fix Plan preserves bytes outside replacement ranges', securityFixIntegrationTestOptions(), async t => {
     for (const [name, input, newline, hasBom, trailing] of cases) {
         await t.test(name, () => {
             const root = createTempWorkspace(t, 'bytes');

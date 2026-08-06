@@ -8,6 +8,14 @@ export function renderSecurityFixPreview(plan, options = {}) {
     out('Security Fix Preview');
     out(`mode: ${applyRequested ? 'apply requested (preview first)' : 'preview'}`);
     out(`file: ${plan.targetPath}`);
+    if (plan.tokenizer?.runtime) {
+        const { runtime } = plan.tokenizer;
+        out(`PHP runtime: ${runtime.phpVersion}`);
+        out(`tokenizer: ${runtime.tokenizerAvailable ? 'available' : 'unavailable'}`);
+        out(`tokenizer helper schema: ${runtime.helperSchemaVersion}`);
+        out(`runtime status: ${runtime.gate.status}`);
+        if (runtime.gate.warning) out(`runtime note: ${runtime.gate.warning}`);
+    }
     if (plan.encoding) {
         out(`encoding: ${plan.encoding.charset}${plan.encoding.bom ? ' with BOM' : ''}`);
         out(`newline: ${plan.newline.style}`);

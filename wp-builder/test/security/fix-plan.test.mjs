@@ -3,10 +3,10 @@ import fs from 'node:fs';
 import test from 'node:test';
 import { buildSecurityFixPlan, sha256 } from '../../lib/security/fix-plan.js';
 import { renderSecurityFixPreview } from '../../lib/security/fix-preview.js';
-import { phpIntegrationTestOptions } from '../helpers/php-runtime.mjs';
+import { inspectPhpRuntime, securityFixIntegrationTestOptions } from '../helpers/php-runtime.mjs';
 import { createTempWorkspace, writeTempFile } from '../helpers/temp-workspace.mjs';
 
-test('Security Fix Plan contains immutable source and preview data without writing', phpIntegrationTestOptions(), t => {
+test('Security Fix Plan contains immutable source and preview data without writing', securityFixIntegrationTestOptions(), t => {
     const root = createTempWorkspace(t, 'fix-plan');
     const input = Buffer.from("<p><?= SCF::get('title') ?></p>\n");
     const file = writeTempFile(root, 'case.php', input);
@@ -17,6 +17,15 @@ test('Security Fix Plan contains immutable source and preview data without writi
     assert.equal(plan.snapshot.symlink, false);
     assert.equal(plan.snapshot.size, input.length);
     assert.equal(plan.snapshot.hash, sha256(input));
+    assert.equal(plan.snapshot.metadata.platform, process.platform);
+    assert.equal(typeof plan.snapshot.metadata.identity.dev, 'number');
+    assert.equal(typeof plan.snapshot.metadata.identity.ino, 'number');
+    assert.equal(plan.snapshot.metadata.identity.nlink, 1);
+    assert.equal(typeof plan.snapshot.metadata.stat.mode, 'number');
+    assert.equal(typeof plan.snapshot.metadata.stat.uid, 'number');
+    assert.equal(typeof plan.snapshot.metadata.stat.gid, 'number');
+    assert.equal(plan.snapshot.metadata.capability.inspectable, true);
+    assert.deepEqual(plan.snapshot.metadata.capability.blockingReasons, []);
     assert.deepEqual(plan.originalBytes, input);
     assert.notDeepEqual(plan.desiredBytes, input);
     assert.equal(plan.desiredHash, sha256(plan.desiredBytes));
@@ -27,6 +36,11 @@ test('Security Fix Plan contains immutable source and preview data without writi
     assert.equal(plan.lint.available, true);
     assert.equal(plan.lint.passed, true);
     assert.equal(plan.canApply, true);
+    const phpRuntime = inspectPhpRuntime();
+    assert.equal(plan.tokenizer.runtime.phpVersion, phpRuntime.phpVersion);
+    assert.equal(plan.tokenizer.runtime.tokenizerAvailable, true);
+    assert.equal(plan.tokenizer.runtime.helperSchemaVersion, 1);
+    assert.equal(plan.tokenizer.runtime.gate.status, 'VERIFIED_APPLY_CANDIDATE');
 
     const output = [];
     const errors = [];
@@ -37,6 +51,11 @@ test('Security Fix Plan contains immutable source and preview data without writi
     assert.ok(output.includes('No files changed.'));
     assert.ok(output.some(line => String(line).includes('AUTO_FIXABLE')));
     assert.ok(output.some(line => String(line).includes('unified diff:')));
+    assert.ok(output.includes(`PHP runtime: ${phpRuntime.phpVersion}`));
+    assert.ok(output.includes('runtime status: VERIFIED_APPLY_CANDIDATE'));
+    if (plan.snapshot.metadata.windows?.daclSddl) {
+        assert.ok(!output.join('\n').includes(plan.snapshot.metadata.windows.daclSddl));
+    }
     assert.deepEqual(errors, []);
     assert.deepEqual(fs.readFileSync(file), input);
 });

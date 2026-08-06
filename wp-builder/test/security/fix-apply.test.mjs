@@ -6,7 +6,7 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { applySecurityFixPlan } from '../../lib/security/fix-apply.js';
 import { buildSecurityFixPlan, takeSecurityFileSnapshot } from '../../lib/security/fix-plan.js';
-import { phpIntegrationTestOptions } from '../helpers/php-runtime.mjs';
+import { securityFixIntegrationTestOptions } from '../helpers/php-runtime.mjs';
 import {
     assertNoSecurityArtifacts,
     assertTempTarget,
@@ -32,7 +32,7 @@ async function expectApplyError(action, exitCode, code) {
     });
 }
 
-test('Security Fix Apply safety matrix', phpIntegrationTestOptions(), async t => {
+test('Security Fix Apply safety matrix', securityFixIntegrationTestOptions(), async t => {
     await t.test('apply success', async st => {
         const fixture = createPlan(st, 'apply-success');
         const result = await applySecurityFixPlan(fixture.plan, { assumeYes: true });

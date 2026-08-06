@@ -20,7 +20,11 @@ function collectSecurityArtifacts(root) {
         fs.readdirSync(directory, { withFileTypes: true }).forEach(entry => {
             const entryPath = path.join(directory, entry.name);
             if (entry.isDirectory()) walk(entryPath);
-            else if (entry.name.includes('.security-fix.tmp') || entry.name.endsWith('.security-fix.lock')) artifacts.push(entryPath);
+            else if (
+                entry.name.includes('.security-fix.tmp') ||
+                entry.name.endsWith('.security-fix.lock') ||
+                entry.name.endsWith('.security-fix.rollback')
+            ) artifacts.push(entryPath);
         });
     };
     walk(root);
@@ -28,7 +32,7 @@ function collectSecurityArtifacts(root) {
 }
 
 export function assertNoSecurityArtifacts(tempRoot) {
-    assert.deepEqual(collectSecurityArtifacts(tempRoot), [], 'Security Fix temp or lock files were left behind.');
+    assert.deepEqual(collectSecurityArtifacts(tempRoot), [], 'Security Fix temp, lock, or rollback files were left behind.');
 }
 
 export function createTempWorkspace(t, label = 'workspace') {

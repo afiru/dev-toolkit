@@ -3,6 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { analyzeSecurityFile } from './analyzer.js';
+import {
+    inspectSecurityMetadata,
+    metadataBlockingReasons
+} from './metadata.js';
+import { phpRuntimeBlockingReason } from './php-runtime-contract.js';
 
 export class SecurityPlanError extends Error {
     constructor(message, exitCode = 1, code = 'SECURITY_PLAN_ERROR') {
@@ -38,7 +43,7 @@ export function resolveSecurityTarget(workspaceRoot, requestedPath) {
     return targetPath;
 }
 
-export function takeSecurityFileSnapshot(filePath) {
+export function takeSecurityFileSnapshot(filePath, options = {}) {
     try {
         const stat = fs.lstatSync(filePath);
         if (stat.isSymbolicLink()) return {
@@ -60,6 +65,7 @@ export function takeSecurityFileSnapshot(filePath) {
             reason: 'Security target is not a normal file.'
         };
         const bytes = fs.readFileSync(filePath);
+        const metadata = inspectSecurityMetadata(filePath, stat, options.metadata ?? {});
         return {
             state: 'present',
             normalFile: true,
@@ -67,6 +73,7 @@ export function takeSecurityFileSnapshot(filePath) {
             size: bytes.length,
             hash: sha256(bytes),
             bytes,
+            metadata,
             reason: null
         };
     } catch (error) {
@@ -233,10 +240,11 @@ export function buildSecurityFixPlan({
     phpCommand = 'php',
     tokenizerPhpCommand = phpCommand,
     lintPhpCommand = phpCommand,
-    tokenizerPath
+    tokenizerPath,
+    metadataOptions
 }) {
     const targetPath = resolveSecurityTarget(workspaceRoot, file);
-    const snapshot = takeSecurityFileSnapshot(targetPath);
+    const snapshot = takeSecurityFileSnapshot(targetPath, { metadata: metadataOptions });
     if (snapshot.state !== 'present') return blockedPlan({
         targetPath,
         workspaceRoot,
@@ -269,10 +277,18 @@ export function buildSecurityFixPlan({
         }));
     const overlaps = findOverlaps(replacements);
     const blockingReasons = [];
-    if (!analysis.canAnalyze) blockingReasons.push({
-        code: analysis.tokenizer.available ? 'PARSE_UNSAFE' : 'PHP_TOKENIZER_UNAVAILABLE',
-        message: analysis.tokenizer.error
-    });
+    blockingReasons.push(...metadataBlockingReasons(snapshot.metadata));
+    const runtimeBlocking = phpRuntimeBlockingReason(analysis.tokenizer.runtime);
+    if (runtimeBlocking) blockingReasons.push(runtimeBlocking);
+    if (!analysis.canAnalyze) {
+        const code = analysis.tokenizer.errorCode ?? (
+            analysis.tokenizer.available ? 'WPB-SCF-PARSE-UNSAFE' : 'PHP_TOKENIZER_UNAVAILABLE'
+        );
+        if (!blockingReasons.some(reason => reason.code === code)) blockingReasons.push({
+            code,
+            message: analysis.tokenizer.error
+        });
+    }
     if (overlaps.length > 0) blockingReasons.push({
         code: 'OVERLAPPING_RANGES',
         message: 'Auto-fix replacement ranges overlap.'

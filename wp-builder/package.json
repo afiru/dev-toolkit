@@ -9,7 +9,9 @@
     "test": "node --test test/security/security.test.mjs test/security/legacy-security-fix.characterization.test.mjs",
     "test:security": "node --test test/security/security.test.mjs test/security/legacy-security-fix.characterization.test.mjs",
     "test:security:required": "node --test test/security/security-required.test.mjs",
-    "test:security:metadata": "node --test test/security/metadata.test.mjs"
+    "test:security:metadata": "node --test test/security/metadata.test.mjs test/security/linux-metadata.test.mjs test/security/linux-rollback.test.mjs",
+    "test:security:php-current": "node --test test/security/php-matrix.test.mjs",
+    "test:security:php-required": "node --test test/security/php-matrix.test.mjs"
   },
   "dependencies": {
     "axios": "^1.18.1",

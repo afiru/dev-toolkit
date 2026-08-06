@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wp-builder.local/windows-inspector/protocol-schema-v1.json",
+  "title": "wp-builder Windows native inspector protocol v1",
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "Inspect request",
+      "required": ["schemaVersion", "operation", "requestId", "target"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "operation": { "const": "inspect" },
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "target": {
+          "type": "object",
+          "required": ["path"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "title": "Inspect response",
+      "required": ["schemaVersion", "helperVersion", "requestId", "ok", "operation"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "helperVersion": { "type": "string" },
+        "requestId": { "type": "string" },
+        "ok": { "type": "boolean" },
+        "operation": { "const": "inspect" },
+        "adapter": { "const": "windows-native-inspector-v1" },
+        "architecture": { "enum": ["x64", "arm64", "unknown"] },
+        "filesystem": { "type": "object" },
+        "file": { "type": "object" },
+        "security": { "type": "object" },
+        "streams": { "type": "object" },
+        "compression": { "type": "object" },
+        "encryption": { "type": "object" },
+        "capabilities": { "type": "object" },
+        "compatibility": { "type": "object" },
+        "metadataFingerprint": { "type": "string" },
+        "blockingReasons": { "type": "array" },
+        "error": { "type": "object" }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

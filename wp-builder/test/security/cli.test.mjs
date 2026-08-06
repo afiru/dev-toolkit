@@ -3,10 +3,10 @@ import fs from 'node:fs';
 import test from 'node:test';
 import { runCli } from '../helpers/cli-runner.mjs';
 import { sha256 } from '../helpers/hash.mjs';
-import { phpIntegrationTestOptions } from '../helpers/php-runtime.mjs';
+import { securityFixIntegrationTestOptions } from '../helpers/php-runtime.mjs';
 import { createTempWorkspace, writeTempFile } from '../helpers/temp-workspace.mjs';
 
-test('security:fix CLI preview and option contract', phpIntegrationTestOptions(), async t => {
+test('security:fix CLI preview and option contract', securityFixIntegrationTestOptions(), async t => {
     await t.test('preview is read-only', st => {
         const root = createTempWorkspace(st, 'cli-preview');
         const file = writeTempFile(root, 'case.php', "<p><?= SCF::get('title') ?></p>\n");
