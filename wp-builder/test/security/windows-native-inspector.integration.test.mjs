@@ -174,6 +174,7 @@ const validationBooleanFields = [
     'groupMatches',
     'daclMatches',
     'daclPresentMatches',
+    'daclNullMatches',
     'protectedAclMatches',
     'daclAutoInheritedMatches',
     'daclAutoInheritRequiredMatches',
@@ -529,6 +530,18 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         assert.equal(after.streams.inventoryDigest, before.streams.inventoryDigest);
     });
 
+    await t.test('hidden attribute is explicitly restored after replace', () => {
+        const fixture = files('hidden');
+        const setup = powershell(`(Get-Item -LiteralPath ${psQuote(fixture.target)} -Force).Attributes = ((Get-Item -LiteralPath ${psQuote(fixture.target)} -Force).Attributes -bor [IO.FileAttributes]::Hidden)`);
+        assert.equal(setup.status, 0, setup.stderr);
+        const before = inspect(fixture.target);
+        const result = runReplace(fixture);
+        reportSafeValidation('hidden-attribute', result.response);
+        assert.equal(result.status, 0, JSON.stringify(result.response));
+        assert.equal(inspect(fixture.target).file.attributes, before.file.attributes);
+        assert.equal(powershell(`if ((Get-Item -LiteralPath ${psQuote(fixture.target)} -Force).Attributes -band [IO.FileAttributes]::Hidden) { exit 0 } else { exit 1 }`).status, 0);
+    });
+
     await t.test('readonly target either preserves metadata or fails without changing content', () => {
         const fixture = files('readonly-replace');
         const setup = powershell(`(Get-Item -LiteralPath ${psQuote(fixture.target)} -Force).IsReadOnly = $true`);
@@ -649,6 +662,46 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
         const after = inspect(fixture.target);
         assert.equal(after.metadataFingerprint, before.metadataFingerprint);
+    });
+
+    await t.test('DACL restoration failure rolls back only after complete metadata restoration', () => {
+        const fixture = files('dacl-restore-failure');
+        const before = inspect(fixture.target);
+        const original = fs.readFileSync(fixture.target);
+        const result = runReplace(fixture, {
+            env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'dacl-restoration-failure' }
+        });
+        reportSafeValidation('dacl-restoration-failure', result.response);
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
+        assert.deepEqual(fs.readFileSync(fixture.target), original);
+        assert.equal(inspect(fixture.target).metadataFingerprint, before.metadataFingerprint);
+    });
+
+    await t.test('attribute restoration failure rolls back only after complete metadata restoration', () => {
+        const fixture = files('attribute-restore-failure');
+        const before = inspect(fixture.target);
+        const original = fs.readFileSync(fixture.target);
+        const result = runReplace(fixture, {
+            env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'attribute-restoration-failure' }
+        });
+        reportSafeValidation('attribute-restoration-failure', result.response);
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
+        assert.deepEqual(fs.readFileSync(fixture.target), original);
+        assert.equal(inspect(fixture.target).metadataFingerprint, before.metadataFingerprint);
+    });
+
+    await t.test('rollback restoration failure remains recovery-required', () => {
+        const fixture = files('rollback-restore-failure');
+        const result = runReplace(fixture, {
+            env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'rollback-restoration-failure' }
+        });
+        reportSafeValidation('rollback-restoration-failure', result.response);
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'WINDOWS_RECOVERY_REQUIRED');
+        assert.equal(result.response.error.phase, 'rollback-security-restore');
+        assert.equal(fs.existsSync(fixture.replacement), true);
     });
 
     await t.test('unverifiable backup produces recovery-required without destructive fallback', () => {

@@ -37,7 +37,7 @@
       "required": [
         "stage", "subject", "contentHashMatches", "sizeMatches", "volumeMatches",
         "identityMatches", "ownerMatches", "groupMatches", "daclMatches",
-        "daclPresentMatches", "protectedAclMatches", "daclAutoInheritedMatches",
+        "daclPresentMatches", "daclNullMatches", "protectedAclMatches", "daclAutoInheritedMatches",
         "daclAutoInheritRequiredMatches", "daclRevisionMatches", "aceCountMatches",
         "explicitAceCountMatches", "inheritedAceCountMatches", "aceOrderDigestMatches",
         "semanticAceSetDigestMatches", "accessMaskDigestMatches",
@@ -61,6 +61,7 @@
         "groupMatches": { "type": "boolean" },
         "daclMatches": { "type": "boolean" },
         "daclPresentMatches": { "type": "boolean" },
+        "daclNullMatches": { "type": "boolean" },
         "protectedAclMatches": { "type": "boolean" },
         "daclAutoInheritedMatches": { "type": "boolean" },
         "daclAutoInheritRequiredMatches": { "type": "boolean" },

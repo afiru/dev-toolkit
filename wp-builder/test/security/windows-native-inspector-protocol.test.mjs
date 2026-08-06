@@ -118,7 +118,7 @@ test('protocol v1 inspect remains stable and protocol v2 defines replace snapsho
     assert.deepEqual(v2.$defs.validationDiagnostic.required, [
         'stage', 'subject', 'contentHashMatches', 'sizeMatches', 'volumeMatches',
         'identityMatches', 'ownerMatches', 'groupMatches', 'daclMatches',
-        'daclPresentMatches', 'protectedAclMatches', 'daclAutoInheritedMatches',
+        'daclPresentMatches', 'daclNullMatches', 'protectedAclMatches', 'daclAutoInheritedMatches',
         'daclAutoInheritRequiredMatches', 'daclRevisionMatches', 'aceCountMatches',
         'explicitAceCountMatches', 'inheritedAceCountMatches', 'aceOrderDigestMatches',
         'semanticAceSetDigestMatches', 'accessMaskDigestMatches',

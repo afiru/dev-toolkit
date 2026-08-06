@@ -306,6 +306,17 @@ std::string sidFingerprint(PSID sid) {
     return digestTagged("wpb-sid-v1", utf8);
 }
 
+struct InspectionError : std::runtime_error {
+    std::string code;
+    DWORD windowsError;
+    std::string phase;
+    std::string validationJson;
+    InspectionError(std::string errorCode, DWORD nativeError, std::string errorPhase, const std::string& message,
+        std::string safeValidationJson = {})
+        : std::runtime_error(message), code(std::move(errorCode)), windowsError(nativeError), phase(std::move(errorPhase)),
+          validationJson(std::move(safeValidationJson)) {}
+};
+
 struct SecurityInspection {
     std::string daclFingerprint;
     std::string aceOrderDigest;
@@ -314,6 +325,7 @@ struct SecurityInspection {
     std::string inheritanceFlagsDigest;
     std::string trusteeDigest;
     bool daclPresent = false;
+    bool daclNull = false;
     bool daclProtected = false;
     bool daclAutoInherited = false;
     bool daclAutoInheritRequired = false;
@@ -458,6 +470,7 @@ SecurityInspection inspectSecurity(HANDLE file) {
         PACL descriptorDacl = nullptr;
         if (!GetSecurityDescriptorDacl(descriptor, &present, &descriptorDacl, &defaulted)) throw std::runtime_error("GetSecurityDescriptorDacl failed.");
         result.daclPresent = present != FALSE;
+        result.daclNull = present != FALSE && descriptorDacl == nullptr;
         std::string state = "missing";
         if (present && descriptorDacl == nullptr) state = "null";
         else if (present && descriptorDacl->AceCount == 0) state = "empty";
@@ -511,6 +524,63 @@ SecurityInspection inspectSecurity(HANDLE file) {
     }
     LocalFree(descriptor);
     return result;
+}
+
+struct SecurityDescriptorSnapshot {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PSID owner = nullptr;
+    PSID group = nullptr;
+    PACL dacl = nullptr;
+    bool daclPresent = false;
+    bool daclProtected = false;
+
+    SecurityDescriptorSnapshot() = default;
+    SecurityDescriptorSnapshot(const SecurityDescriptorSnapshot&) = delete;
+    SecurityDescriptorSnapshot& operator=(const SecurityDescriptorSnapshot&) = delete;
+    SecurityDescriptorSnapshot(SecurityDescriptorSnapshot&& other) noexcept
+        : descriptor(other.descriptor), owner(other.owner), group(other.group), dacl(other.dacl),
+          daclPresent(other.daclPresent), daclProtected(other.daclProtected) {
+        other.descriptor = nullptr;
+        other.owner = nullptr;
+        other.group = nullptr;
+        other.dacl = nullptr;
+    }
+    ~SecurityDescriptorSnapshot() {
+        if (descriptor) {
+            SecureZeroMemory(descriptor, GetSecurityDescriptorLength(descriptor));
+            LocalFree(descriptor);
+        }
+    }
+};
+
+SecurityDescriptorSnapshot captureSecurityDescriptor(const std::wstring& path) {
+    Handle file(CreateFileW(path.c_str(), READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (file.value == INVALID_HANDLE_VALUE) {
+        throw InspectionError("SECURITY_SNAPSHOT_FAILED", GetLastError(), "security-snapshot", "Security snapshot open failed.");
+    }
+    SecurityDescriptorSnapshot snapshot;
+    const DWORD status = GetSecurityInfo(file.value, SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &snapshot.owner, &snapshot.group, &snapshot.dacl, nullptr, &snapshot.descriptor);
+    if (status != ERROR_SUCCESS) {
+        throw InspectionError("SECURITY_SNAPSHOT_FAILED", status, "security-snapshot", "Security snapshot failed.");
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    if (!GetSecurityDescriptorControl(snapshot.descriptor, &control, &revision)) {
+        throw InspectionError("SECURITY_SNAPSHOT_FAILED", GetLastError(), "security-snapshot", "Security control snapshot failed.");
+    }
+    snapshot.daclProtected = (control & SE_DACL_PROTECTED) != 0;
+    BOOL present = FALSE;
+    BOOL defaulted = FALSE;
+    PACL descriptorDacl = nullptr;
+    if (!GetSecurityDescriptorDacl(snapshot.descriptor, &present, &descriptorDacl, &defaulted)) {
+        throw InspectionError("SECURITY_SNAPSHOT_FAILED", GetLastError(), "security-snapshot", "DACL snapshot failed.");
+    }
+    snapshot.daclPresent = present != FALSE;
+    snapshot.dacl = descriptorDacl;
+    return snapshot;
 }
 
 struct StreamEntry { std::wstring name; std::uint64_t size = 0; std::string hash; };
@@ -706,17 +776,6 @@ std::string errorResponse(int schemaVersion, const std::string& operation, const
     return response + "}";
 }
 
-struct InspectionError : std::runtime_error {
-    std::string code;
-    DWORD windowsError;
-    std::string phase;
-    std::string validationJson;
-    InspectionError(std::string errorCode, DWORD nativeError, std::string errorPhase, const std::string& message,
-        std::string safeValidationJson = {})
-        : std::runtime_error(message), code(std::move(errorCode)), windowsError(nativeError), phase(std::move(errorPhase)),
-          validationJson(std::move(safeValidationJson)) {}
-};
-
 std::string inspect(const std::wstring& targetPath, const std::string& requestId, int schemaVersion) {
     const DWORD access = GENERIC_READ | READ_CONTROL;
     Handle file(CreateFileW(targetPath.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -781,6 +840,9 @@ std::string inspect(const std::wstring& targetPath, const std::string& requestId
     const bool noScrub = (basic.FileAttributes & FILE_ATTRIBUTE_NO_SCRUB_DATA) != 0;
     const bool integrity = (basic.FileAttributes & FILE_ATTRIBUTE_INTEGRITY_STREAM) != 0;
     const bool offlineOrRecall = (basic.FileAttributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) != 0;
+    constexpr DWORD restorableAttributeMask = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM |
+        FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+    const bool unsupportedAttributeBits = (basic.FileAttributes & ~restorableAttributeMask) != 0;
     const bool persistentAcls = (filesystemFlags & FILE_PERSISTENT_ACLS) != 0;
     const bool localNtfsCandidate = filesystem == "NTFS" && persistentAcls && !remote && driveType == DRIVE_FIXED && normal && !reparse;
 
@@ -818,6 +880,7 @@ std::string inspect(const std::wstring& targetPath, const std::string& requestId
     if (remote) reasons.push_back("REMOTE_FILESYSTEM_UNSUPPORTED");
     if (driveType != DRIVE_FIXED) reasons.push_back("WINDOWS_DRIVE_TYPE_UNSUPPORTED");
     if (!persistentAcls) reasons.push_back("WINDOWS_PERSISTENT_ACL_UNAVAILABLE");
+    if (!security.daclPresent || security.daclNull) reasons.push_back("WINDOWS_DACL_UNSUPPORTED");
     if (!normal) reasons.push_back("NON_REGULAR_FILE");
     if (reparse) reasons.push_back("REPARSE_POINT_UNSUPPORTED");
     if (readonly) reasons.push_back("READ_ONLY_TARGET");
@@ -826,11 +889,15 @@ std::string inspect(const std::wstring& targetPath, const std::string& requestId
     if (!backupStreams.entries.empty()) reasons.push_back("WINDOWS_ADS_UNSUPPORTED");
     if (backupStreams.eaPresent) reasons.push_back("WINDOWS_EA_UNSUPPORTED");
     if (sparse) reasons.push_back("WINDOWS_SPARSE_UNSUPPORTED");
+    if (compressed) reasons.push_back("WINDOWS_COMPRESSED_UNSUPPORTED");
     if (noScrub) reasons.push_back("WINDOWS_NO_SCRUB_UNSUPPORTED");
     if (integrity) reasons.push_back("WINDOWS_INTEGRITY_STREAM_UNSUPPORTED");
     if (offlineOrRecall) reasons.push_back("WINDOWS_OFFLINE_OR_RECALL_UNSUPPORTED");
     if (backupStreams.unknownPresent) reasons.push_back("WINDOWS_UNKNOWN_BACKUP_STREAM");
     if (encrypted) reasons.push_back("WINDOWS_ENCRYPTED_UNSUPPORTED");
+    if (unsupportedAttributeBits && !sparse && !compressed && !encrypted && !noScrub && !integrity && !offlineOrRecall) {
+        reasons.push_back("WINDOWS_ATTRIBUTES_UNSUPPORTED");
+    }
 
     std::ostringstream blocking;
     blocking << '[';
@@ -851,6 +918,7 @@ std::string inspect(const std::wstring& targetPath, const std::string& requestId
         << escapeJson(std::to_string(standard.NumberOfLinks)) << ",\"size\":" << escapeJson(std::to_string(standard.EndOfFile.QuadPart))
         << ",\"attributes\":" << escapeJson(attributes) << ",\"readonly\":" << (readonly ? "true" : "false") << "},\"security\":{\"daclFingerprint\":"
         << escapeJson(security.daclFingerprint) << ",\"daclPresent\":" << (security.daclPresent ? "true" : "false")
+        << ",\"daclNull\":" << (security.daclNull ? "true" : "false")
         << ",\"daclProtected\":" << (security.daclProtected ? "true" : "false")
         << ",\"daclAutoInherited\":" << (security.daclAutoInherited ? "true" : "false")
         << ",\"daclAutoInheritRequired\":" << (security.daclAutoInheritRequired ? "true" : "false")
@@ -902,6 +970,7 @@ struct ReplaceSnapshot {
     bool normalFile = false;
     bool reparsePoint = false;
     bool daclPresent = false;
+    bool daclNull = false;
     bool daclProtected = false;
     bool daclAutoInherited = false;
     bool daclAutoInheritRequired = false;
@@ -978,6 +1047,7 @@ ReplaceSnapshot replaceSnapshot(const std::wstring& path) {
     snapshot.groupFingerprint = jsonString(security, "groupFingerprint");
     snapshot.daclFingerprint = jsonString(security, "daclFingerprint");
     snapshot.daclPresent = jsonBoolean(security, "daclPresent");
+    snapshot.daclNull = jsonBoolean(security, "daclNull");
     snapshot.daclProtected = jsonBoolean(security, "daclProtected");
     snapshot.daclAutoInherited = jsonBoolean(security, "daclAutoInherited");
     snapshot.daclAutoInheritRequired = jsonBoolean(security, "daclAutoInheritRequired");
@@ -1097,6 +1167,7 @@ struct ValidationDiagnostic {
     bool groupMatches = false;
     bool daclMatches = false;
     bool daclPresentMatches = false;
+    bool daclNullMatches = false;
     bool protectedAclMatches = false;
     bool daclAutoInheritedMatches = false;
     bool daclAutoInheritRequiredMatches = false;
@@ -1134,7 +1205,7 @@ struct ValidationDiagnostic {
 
     bool allMatch() const {
         return contentHashMatches && sizeMatches && volumeMatches && identityMatches && ownerMatches &&
-            groupMatches && daclMatches && daclPresentMatches && protectedAclMatches &&
+            groupMatches && daclMatches && daclPresentMatches && daclNullMatches && protectedAclMatches &&
             daclAutoInheritedMatches && daclAutoInheritRequiredMatches && daclRevisionMatches &&
             aceCountMatches && explicitAceCountMatches && inheritedAceCountMatches &&
             aceOrderDigestMatches && semanticAceSetDigestMatches && accessMaskDigestMatches &&
@@ -1157,6 +1228,7 @@ ValidationDiagnostic compareSnapshots(const std::string& stage, const std::strin
     result.groupMatches = actual.groupFingerprint == expected.groupFingerprint;
     result.daclMatches = actual.daclFingerprint == expected.daclFingerprint;
     result.daclPresentMatches = actual.daclPresent == expected.daclPresent;
+    result.daclNullMatches = actual.daclNull == expected.daclNull;
     result.protectedAclMatches = actual.daclProtected == expected.daclProtected;
     result.daclAutoInheritedMatches = actual.daclAutoInherited == expected.daclAutoInherited;
     result.daclAutoInheritRequiredMatches = actual.daclAutoInheritRequired == expected.daclAutoInheritRequired;
@@ -1215,6 +1287,7 @@ std::string validationDiagnosticsJson(const std::vector<ValidationDiagnostic>& d
             << ",\"groupMatches\":" << (item.groupMatches ? "true" : "false")
             << ",\"daclMatches\":" << (item.daclMatches ? "true" : "false")
             << ",\"daclPresentMatches\":" << (item.daclPresentMatches ? "true" : "false")
+            << ",\"daclNullMatches\":" << (item.daclNullMatches ? "true" : "false")
             << ",\"protectedAclMatches\":" << (item.protectedAclMatches ? "true" : "false")
             << ",\"daclAutoInheritedMatches\":" << (item.daclAutoInheritedMatches ? "true" : "false")
             << ",\"daclAutoInheritRequiredMatches\":" << (item.daclAutoInheritRequiredMatches ? "true" : "false")
@@ -1317,20 +1390,142 @@ bool removeBackupArtifact(const std::wstring& path) {
     return false;
 }
 
+struct MetadataRestoreResult {
+    bool succeeded = false;
+    DWORD windowsError = ERROR_SUCCESS;
+    std::string phase;
+};
+
+MetadataRestoreResult restoreOriginalMetadata(const std::wstring& path,
+    const SecurityDescriptorSnapshot& securitySnapshot, const ReplaceSnapshot& original,
+    bool rollback, const std::wstring& testFault) {
+    MetadataRestoreResult result;
+    try {
+        const ReplaceSnapshot current = replaceSnapshot(path);
+        const bool ownerDiffers = current.ownerFingerprint != original.ownerFingerprint;
+        const bool groupDiffers = current.groupFingerprint != original.groupFingerprint;
+        const bool daclDiffers = current.daclFingerprint != original.daclFingerprint ||
+            current.daclPresent != original.daclPresent || current.daclNull != original.daclNull ||
+            current.daclProtected != original.daclProtected ||
+            current.daclAutoInherited != original.daclAutoInherited ||
+            current.daclAutoInheritRequired != original.daclAutoInheritRequired ||
+            current.aceOrderDigest != original.aceOrderDigest ||
+            current.semanticAceSetDigest != original.semanticAceSetDigest;
+
+        if (!securitySnapshot.daclPresent || securitySnapshot.dacl == nullptr) {
+            result.windowsError = ERROR_NOT_SUPPORTED;
+            result.phase = rollback ? "rollback-security-restore" : "security-restore";
+            return result;
+        }
+
 #if defined(WPB_NATIVE_TEST_HOOKS)
-void applyReplaceTestFault(const std::wstring& targetPath, const std::wstring& replacementPath) {
+        if ((!rollback && testFault == L"dacl-restoration-failure") ||
+            (rollback && testFault == L"rollback-restoration-failure")) {
+            result.windowsError = ERROR_ACCESS_DENIED;
+            result.phase = rollback ? "rollback-security-restore" : "security-restore";
+            return result;
+        }
+#else
+        (void)testFault;
+#endif
+
+        if (ownerDiffers || groupDiffers || daclDiffers) {
+            DWORD access = READ_CONTROL;
+            if (ownerDiffers || groupDiffers) access |= WRITE_OWNER;
+            if (daclDiffers) access |= WRITE_DAC;
+            Handle file(CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+            if (file.value == INVALID_HANDLE_VALUE) {
+                result.windowsError = GetLastError();
+                result.phase = rollback ? "rollback-security-restore" : "security-restore";
+                return result;
+            }
+            SECURITY_INFORMATION information = 0;
+            if (ownerDiffers) information |= OWNER_SECURITY_INFORMATION;
+            if (groupDiffers) information |= GROUP_SECURITY_INFORMATION;
+            if (daclDiffers) {
+                information |= DACL_SECURITY_INFORMATION;
+                information |= securitySnapshot.daclProtected
+                    ? PROTECTED_DACL_SECURITY_INFORMATION
+                    : UNPROTECTED_DACL_SECURITY_INFORMATION;
+            }
+            const DWORD status = SetSecurityInfo(file.value, SE_FILE_OBJECT, information,
+                ownerDiffers ? securitySnapshot.owner : nullptr,
+                groupDiffers ? securitySnapshot.group : nullptr,
+                daclDiffers ? securitySnapshot.dacl : nullptr,
+                nullptr);
+            if (status != ERROR_SUCCESS) {
+                result.windowsError = status;
+                result.phase = rollback ? "rollback-security-restore" : "security-restore";
+                return result;
+            }
+        }
+
+        const ReplaceSnapshot afterSecurity = replaceSnapshot(path);
+        if (afterSecurity.attributeBits != original.attributeBits) {
+#if defined(WPB_NATIVE_TEST_HOOKS)
+            if (!rollback && testFault == L"attribute-restoration-failure") {
+                result.windowsError = ERROR_ACCESS_DENIED;
+                result.phase = "attribute-restore";
+                return result;
+            }
+#endif
+            Handle file(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+            if (file.value == INVALID_HANDLE_VALUE) {
+                result.windowsError = GetLastError();
+                result.phase = rollback ? "rollback-attribute-restore" : "attribute-restore";
+                return result;
+            }
+            FILE_BASIC_INFO basic{};
+            if (!GetFileInformationByHandleEx(file.value, FileBasicInfo, &basic, sizeof(basic))) {
+                result.windowsError = GetLastError();
+                result.phase = rollback ? "rollback-attribute-restore" : "attribute-restore";
+                return result;
+            }
+            basic.FileAttributes = original.attributeBits;
+            if (!SetFileInformationByHandle(file.value, FileBasicInfo, &basic, sizeof(basic))) {
+                result.windowsError = GetLastError();
+                result.phase = rollback ? "rollback-attribute-restore" : "attribute-restore";
+                return result;
+            }
+        }
+        result.succeeded = true;
+        return result;
+    } catch (...) {
+        result.windowsError = ERROR_INVALID_DATA;
+        result.phase = rollback ? "rollback-metadata-inspection" : "metadata-inspection";
+        return result;
+    }
+}
+
+std::wstring replaceTestFault() {
+#if defined(WPB_NATIVE_TEST_HOOKS)
     std::array<WCHAR, 64> value{};
     const DWORD length = GetEnvironmentVariableW(L"WPB_TEST_WINDOWS_REPLACE_FAULT", value.data(), static_cast<DWORD>(value.size()));
-    if (length == 0 || length >= static_cast<DWORD>(value.size())) return;
-    const std::wstring fault(value.data(), length);
-    if (fault == L"final-hash-mismatch" || fault == L"rollback-failure") {
+    if (length > 0 && length < static_cast<DWORD>(value.size())) return std::wstring(value.data(), length);
+#endif
+    return {};
+}
+
+#if defined(WPB_NATIVE_TEST_HOOKS)
+void applyPreRestoreTestFault(const std::wstring& targetPath, const std::wstring& replacementPath, const std::wstring& fault) {
+    if (fault == L"final-hash-mismatch" || fault == L"rollback-failure" || fault == L"rollback-restoration-failure") {
         Handle target(CreateFileW(targetPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
         if (target.value != INVALID_HANDLE_VALUE) {
             const char byte = '!'; DWORD written = 0; WriteFile(target.value, &byte, 1, &written, nullptr); FlushFileBuffers(target.value);
         }
         if (fault == L"rollback-failure") CreateDirectoryW(replacementPath.c_str(), nullptr);
-    } else if (fault == L"final-metadata-mismatch") {
+    } else if (fault == L"attribute-restoration-failure") {
+        const DWORD attributes = GetFileAttributesW(targetPath.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES) SetFileAttributesW(targetPath.c_str(), attributes ^ FILE_ATTRIBUTE_HIDDEN);
+    }
+}
+
+void applyPostRestoreTestFault(const std::wstring& targetPath, const std::wstring& fault) {
+    if (fault == L"final-metadata-mismatch") {
         const DWORD attributes = GetFileAttributesW(targetPath.c_str());
         if (attributes != INVALID_FILE_ATTRIBUTES) SetFileAttributesW(targetPath.c_str(), attributes ^ FILE_ATTRIBUTE_HIDDEN);
     }
@@ -1365,6 +1560,7 @@ std::string replaceFiles(const JsonValue& request, const std::string& requestId)
         throw InspectionError("STALE_FILE", ERROR_INVALID_DATA, "snapshot", "A replace endpoint changed after planning.");
     }
 
+    SecurityDescriptorSnapshot originalSecurity = captureSecurityDescriptor(targetPath);
     const ReplaceSnapshot targetBeforeCall = replaceSnapshot(targetPath);
     const ReplaceSnapshot replacementBeforeCall = replaceSnapshot(replacementPath);
     requireBackupAbsent(backupPath);
@@ -1384,8 +1580,14 @@ std::string replaceFiles(const JsonValue& request, const std::string& requestId)
         throw InspectionError("WINDOWS_RECOVERY_REQUIRED", replaceError, "replace-file-partial", "ReplaceFileW left an uncertain state.");
     }
 
+    const std::wstring testFault = replaceTestFault();
 #if defined(WPB_NATIVE_TEST_HOOKS)
-    applyReplaceTestFault(targetPath, replacementPath);
+    applyPreRestoreTestFault(targetPath, replacementPath, testFault);
+#endif
+    const MetadataRestoreResult forwardRestore = restoreOriginalMetadata(
+        targetPath, originalSecurity, original, false, testFault);
+#if defined(WPB_NATIVE_TEST_HOOKS)
+    if (forwardRestore.succeeded) applyPostRestoreTestFault(targetPath, testFault);
 #endif
 
     bool finalValid = false;
@@ -1399,7 +1601,7 @@ std::string replaceFiles(const JsonValue& request, const std::string& requestId)
         const ReplaceSnapshot expectedFinal = expectedFinalSnapshot(original, replacement);
         validationDiagnostics.push_back(compareSnapshots("post-replace", "target", finalTarget, expectedFinal));
         validationDiagnostics.push_back(compareSnapshots("post-replace", "backup", backup, original));
-        finalValid = validationDiagnostics[0].allMatch() && pathMissing(replacementPath);
+        finalValid = forwardRestore.succeeded && validationDiagnostics[0].allMatch() && pathMissing(replacementPath);
         backupValid = validationDiagnostics[1].allMatch();
     } catch (...) {
         finalValid = false;
@@ -1414,15 +1616,19 @@ std::string replaceFiles(const JsonValue& request, const std::string& requestId)
         if (!ReplaceFileW(targetPath.c_str(), backupPath.c_str(), replacementPath.c_str(), 0, nullptr, nullptr)) {
             throw InspectionError("WINDOWS_RECOVERY_REQUIRED", GetLastError(), "rollback", "Automatic rollback failed.", preRollbackDiagnostics);
         }
+        const MetadataRestoreResult rollbackRestore = restoreOriginalMetadata(
+            targetPath, originalSecurity, original, true, testFault);
         bool restored = false;
         try {
             const ReplaceSnapshot rollbackTarget = replaceSnapshot(targetPath);
             validationDiagnostics.push_back(compareSnapshots("post-rollback", "target", rollbackTarget, original));
-            restored = validationDiagnostics.back().allMatch();
+            restored = rollbackRestore.succeeded && validationDiagnostics.back().allMatch();
         } catch (...) {}
         const std::string postRollbackDiagnostics = validationDiagnosticsJson(validationDiagnostics);
         if (!restored) {
-            throw InspectionError("WINDOWS_RECOVERY_REQUIRED", ERROR_INVALID_DATA, "rollback-validation",
+            throw InspectionError("WINDOWS_RECOVERY_REQUIRED",
+                rollbackRestore.succeeded ? ERROR_INVALID_DATA : rollbackRestore.windowsError,
+                rollbackRestore.succeeded ? "rollback-validation" : rollbackRestore.phase,
                 "Rollback validation failed.", postRollbackDiagnostics);
         }
         const bool recoveryRemoved = removeBackupArtifact(replacementPath);
