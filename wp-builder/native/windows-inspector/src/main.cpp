@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -307,11 +308,132 @@ std::string sidFingerprint(PSID sid) {
 
 struct SecurityInspection {
     std::string daclFingerprint;
+    std::string aceOrderDigest;
+    std::string semanticAceSetDigest;
+    std::string accessMaskDigest;
+    std::string inheritanceFlagsDigest;
+    std::string trusteeDigest;
+    bool daclPresent = false;
     bool daclProtected = false;
+    bool daclAutoInherited = false;
+    bool daclAutoInheritRequired = false;
+    bool aceSemanticsComplete = true;
+    std::uint32_t daclRevision = 0;
+    std::uint32_t aceCount = 0;
     std::string ownerFingerprint;
     std::string groupFingerprint;
     std::uint32_t explicitAceCount = 0;
+    std::uint32_t inheritedAceCount = 0;
 };
+
+std::string digestList(const std::string& tag, std::vector<std::string> values, bool sortValues) {
+    if (sortValues) std::sort(values.begin(), values.end());
+    std::string canonical;
+    for (const std::string& value : values) {
+        canonical += std::to_string(value.size()) + ":" + value;
+        canonical.push_back('\0');
+    }
+    return digestTagged(tag, canonical);
+}
+
+bool isObjectAceType(BYTE type) {
+    return type == ACCESS_ALLOWED_OBJECT_ACE_TYPE || type == ACCESS_DENIED_OBJECT_ACE_TYPE ||
+        type == ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE || type == ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE;
+}
+
+bool isSimpleAccessAceType(BYTE type) {
+    return type == ACCESS_ALLOWED_ACE_TYPE || type == ACCESS_DENIED_ACE_TYPE ||
+        type == ACCESS_ALLOWED_CALLBACK_ACE_TYPE || type == ACCESS_DENIED_CALLBACK_ACE_TYPE;
+}
+
+struct AceSemantic {
+    std::string semanticDigest;
+    std::string maskValue;
+    std::string inheritanceFlagsValue;
+    std::string trusteeFingerprint;
+    bool complete = false;
+    bool inherited = false;
+};
+
+AceSemantic inspectAceSemantic(const ACE_HEADER* header) {
+    AceSemantic result;
+    result.inherited = (header->AceFlags & INHERITED_ACE) != 0;
+    result.inheritanceFlagsValue = std::to_string(header->AceFlags);
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(header);
+    const std::size_t aceSize = header->AceSize;
+    if (aceSize < sizeof(ACE_HEADER) + sizeof(ACCESS_MASK)) {
+        result.semanticDigest = digestTagged("wpb-ace-opaque-v1", std::string(reinterpret_cast<const char*>(bytes), aceSize));
+        result.maskValue = "unavailable";
+        result.trusteeFingerprint = result.semanticDigest;
+        return result;
+    }
+
+    ACCESS_MASK mask = 0;
+    std::memcpy(&mask, bytes + sizeof(ACE_HEADER), sizeof(mask));
+    result.maskValue = std::to_string(mask);
+    std::size_t sidOffset = sizeof(ACE_HEADER) + sizeof(ACCESS_MASK);
+    std::string objectMetadata = "none";
+    if (isObjectAceType(header->AceType)) {
+        if (aceSize < sidOffset + sizeof(DWORD)) {
+            result.semanticDigest = digestTagged("wpb-ace-opaque-v1", std::string(reinterpret_cast<const char*>(bytes), aceSize));
+            result.trusteeFingerprint = result.semanticDigest;
+            return result;
+        }
+        DWORD objectFlags = 0;
+        std::memcpy(&objectFlags, bytes + sidOffset, sizeof(objectFlags));
+        sidOffset += sizeof(objectFlags);
+        objectMetadata = "flags=" + std::to_string(objectFlags);
+        const std::size_t guidOffset = sidOffset;
+        if ((objectFlags & ACE_OBJECT_TYPE_PRESENT) != 0) sidOffset += sizeof(GUID);
+        if ((objectFlags & ACE_INHERITED_OBJECT_TYPE_PRESENT) != 0) sidOffset += sizeof(GUID);
+        if (sidOffset > aceSize) {
+            result.semanticDigest = digestTagged("wpb-ace-opaque-v1", std::string(reinterpret_cast<const char*>(bytes), aceSize));
+            result.trusteeFingerprint = result.semanticDigest;
+            return result;
+        }
+        objectMetadata += ";guidDigest=" + digestTagged("wpb-ace-object-guid-v1",
+            std::string(reinterpret_cast<const char*>(bytes + guidOffset), sidOffset - guidOffset));
+    } else if (!isSimpleAccessAceType(header->AceType)) {
+        result.semanticDigest = digestTagged("wpb-ace-opaque-v1", std::string(reinterpret_cast<const char*>(bytes), aceSize));
+        result.trusteeFingerprint = result.semanticDigest;
+        return result;
+    }
+
+    if (sidOffset >= aceSize) {
+        result.semanticDigest = digestTagged("wpb-ace-opaque-v1", std::string(reinterpret_cast<const char*>(bytes), aceSize));
+        result.trusteeFingerprint = result.semanticDigest;
+        return result;
+    }
+    PSID sid = const_cast<std::uint8_t*>(bytes + sidOffset);
+    if (!IsValidSid(sid)) {
+        result.semanticDigest = digestTagged("wpb-ace-opaque-v1", std::string(reinterpret_cast<const char*>(bytes), aceSize));
+        result.trusteeFingerprint = result.semanticDigest;
+        return result;
+    }
+    const DWORD sidLength = GetLengthSid(sid);
+    if (sidLength == 0 || sidOffset + sidLength > aceSize) {
+        result.semanticDigest = digestTagged("wpb-ace-opaque-v1", std::string(reinterpret_cast<const char*>(bytes), aceSize));
+        result.trusteeFingerprint = result.semanticDigest;
+        return result;
+    }
+    result.trusteeFingerprint = sidFingerprint(sid);
+    const std::size_t trailingOffset = sidOffset + sidLength;
+    const std::string trailingDigest = digestTagged("wpb-ace-trailing-v1",
+        std::string(reinterpret_cast<const char*>(bytes + trailingOffset), aceSize - trailingOffset));
+    std::string canonical = "type=" + std::to_string(header->AceType);
+    const auto add = [&canonical](const std::string& name, const std::string& value) {
+        canonical.push_back('\0');
+        canonical += name + "=" + value;
+    };
+    add("flags", result.inheritanceFlagsValue);
+    add("mask", result.maskValue);
+    add("trustee", result.trusteeFingerprint);
+    add("object", objectMetadata);
+    add("trailing", trailingDigest);
+    result.semanticDigest = digestTagged("wpb-ace-semantic-v1", canonical);
+    result.complete = true;
+    return result;
+}
 
 SecurityInspection inspectSecurity(HANDLE file) {
     PSID owner = nullptr;
@@ -329,10 +451,13 @@ SecurityInspection inspectSecurity(HANDLE file) {
         if (!GetSecurityDescriptorControl(descriptor, &control, &descriptorRevision)) throw std::runtime_error("GetSecurityDescriptorControl failed.");
         (void)descriptorRevision;
         result.daclProtected = (control & SE_DACL_PROTECTED) != 0;
+        result.daclAutoInherited = (control & SE_DACL_AUTO_INHERITED) != 0;
+        result.daclAutoInheritRequired = (control & SE_DACL_AUTO_INHERIT_REQ) != 0;
         BOOL present = FALSE;
         BOOL defaulted = FALSE;
         PACL descriptorDacl = nullptr;
         if (!GetSecurityDescriptorDacl(descriptor, &present, &descriptorDacl, &defaulted)) throw std::runtime_error("GetSecurityDescriptorDacl failed.");
+        result.daclPresent = present != FALSE;
         std::string state = "missing";
         if (present && descriptorDacl == nullptr) state = "null";
         else if (present && descriptorDacl->AceCount == 0) state = "empty";
@@ -344,6 +469,8 @@ SecurityInspection inspectSecurity(HANDLE file) {
         const std::string daclSddl = wideToUtf8(sddl);
         LocalFree(sddl);
         const DWORD daclRevision = descriptorDacl ? descriptorDacl->AclRevision : 0;
+        result.daclRevision = daclRevision;
+        result.aceCount = descriptorDacl ? descriptorDacl->AceCount : 0;
         std::string canonical = "state=" + state;
         canonical.push_back('\0');
         canonical += "protected=" + std::string(result.daclProtected ? "true" : "false");
@@ -354,14 +481,30 @@ SecurityInspection inspectSecurity(HANDLE file) {
         result.daclFingerprint = digestTagged("wpb-dacl-v1", canonical);
         result.ownerFingerprint = sidFingerprint(owner);
         result.groupFingerprint = sidFingerprint(group);
+        std::vector<std::string> aceOrder;
+        std::vector<std::string> accessMasks;
+        std::vector<std::string> inheritanceFlags;
+        std::vector<std::string> trustees;
         if (dacl) {
             for (DWORD index = 0; index < dacl->AceCount; ++index) {
                 void* ace = nullptr;
                 if (!GetAce(dacl, index, &ace)) throw std::runtime_error("GetAce failed.");
                 const auto* header = static_cast<ACE_HEADER*>(ace);
-                if ((header->AceFlags & INHERITED_ACE) == 0) ++result.explicitAceCount;
+                const AceSemantic semantic = inspectAceSemantic(header);
+                aceOrder.push_back(semantic.semanticDigest);
+                accessMasks.push_back(semantic.maskValue);
+                inheritanceFlags.push_back(semantic.inheritanceFlagsValue);
+                trustees.push_back(semantic.trusteeFingerprint);
+                result.aceSemanticsComplete = result.aceSemanticsComplete && semantic.complete;
+                if (semantic.inherited) ++result.inheritedAceCount;
+                else ++result.explicitAceCount;
             }
         }
+        result.aceOrderDigest = digestList("wpb-ace-order-v1", aceOrder, false);
+        result.semanticAceSetDigest = digestList("wpb-ace-set-v1", aceOrder, true);
+        result.accessMaskDigest = digestList("wpb-ace-mask-set-v1", accessMasks, true);
+        result.inheritanceFlagsDigest = digestList("wpb-ace-flags-set-v1", inheritanceFlags, true);
+        result.trusteeDigest = digestList("wpb-ace-trustee-set-v1", trustees, true);
     } catch (...) {
         LocalFree(descriptor);
         throw;
@@ -707,7 +850,18 @@ std::string inspect(const std::wstring& targetPath, const std::string& requestId
         << ",\"identity\":{\"volumeSerial\":" << escapeJson(identityVolume) << ",\"fileId\":" << escapeJson(fileId) << "},\"linkCount\":"
         << escapeJson(std::to_string(standard.NumberOfLinks)) << ",\"size\":" << escapeJson(std::to_string(standard.EndOfFile.QuadPart))
         << ",\"attributes\":" << escapeJson(attributes) << ",\"readonly\":" << (readonly ? "true" : "false") << "},\"security\":{\"daclFingerprint\":"
-        << escapeJson(security.daclFingerprint) << ",\"daclProtected\":" << (security.daclProtected ? "true" : "false")
+        << escapeJson(security.daclFingerprint) << ",\"daclPresent\":" << (security.daclPresent ? "true" : "false")
+        << ",\"daclProtected\":" << (security.daclProtected ? "true" : "false")
+        << ",\"daclAutoInherited\":" << (security.daclAutoInherited ? "true" : "false")
+        << ",\"daclAutoInheritRequired\":" << (security.daclAutoInheritRequired ? "true" : "false")
+        << ",\"daclRevision\":" << security.daclRevision << ",\"aceCount\":" << security.aceCount
+        << ",\"explicitAceCount\":" << security.explicitAceCount << ",\"inheritedAceCount\":" << security.inheritedAceCount
+        << ",\"aceSemanticsComplete\":" << (security.aceSemanticsComplete ? "true" : "false")
+        << ",\"aceOrderDigest\":" << escapeJson(security.aceOrderDigest)
+        << ",\"semanticAceSetDigest\":" << escapeJson(security.semanticAceSetDigest)
+        << ",\"accessMaskDigest\":" << escapeJson(security.accessMaskDigest)
+        << ",\"inheritanceFlagsDigest\":" << escapeJson(security.inheritanceFlagsDigest)
+        << ",\"trusteeDigest\":" << escapeJson(security.trusteeDigest)
         << ",\"ownerFingerprint\":" << escapeJson(security.ownerFingerprint) << ",\"groupFingerprint\":" << escapeJson(security.groupFingerprint)
         << "},\"streams\":{\"count\":" << backupStreams.entries.size() << ",\"digest\":" << escapeJson(adsDigest)
         << ",\"inventoryDigest\":" << escapeJson(adsInventoryDigest)
@@ -731,9 +885,15 @@ struct ReplaceSnapshot {
     std::string filesystem;
     std::string driveType;
     std::string attributes;
+    std::uint32_t attributeBits = 0;
     std::string ownerFingerprint;
     std::string groupFingerprint;
     std::string daclFingerprint;
+    std::string aceOrderDigest;
+    std::string semanticAceSetDigest;
+    std::string accessMaskDigest;
+    std::string inheritanceFlagsDigest;
+    std::string trusteeDigest;
     std::string adsDigest;
     std::string adsInventoryDigest;
     std::string compressionFormat;
@@ -741,8 +901,16 @@ struct ReplaceSnapshot {
     bool remote = false;
     bool normalFile = false;
     bool reparsePoint = false;
+    bool daclPresent = false;
     bool daclProtected = false;
+    bool daclAutoInherited = false;
+    bool daclAutoInheritRequired = false;
+    bool aceSemanticsComplete = false;
     bool encrypted = false;
+    std::uint32_t daclRevision = 0;
+    std::uint32_t aceCount = 0;
+    std::uint32_t explicitAceCount = 0;
+    std::uint32_t inheritedAceCount = 0;
     std::uint64_t linkCount = 0;
 };
 
@@ -773,6 +941,13 @@ bool jsonBoolean(const JsonValue& object, const std::string& key) {
     return required(object, key, JsonValue::Type::Boolean).boolean;
 }
 
+std::uint32_t jsonUint32(const JsonValue& object, const std::string& key) {
+    const std::string& value = required(object, key, JsonValue::Type::Number).text;
+    const unsigned long parsed = std::stoul(value);
+    if (parsed > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("JSON integer exceeds uint32 range.");
+    return static_cast<std::uint32_t>(parsed);
+}
+
 ReplaceSnapshot replaceSnapshot(const std::wstring& path) {
     const JsonValue root = JsonParser(inspect(path, "internal-replace-snapshot", 2)).parse();
     const JsonValue& filesystem = required(root, "filesystem", JsonValue::Type::Object);
@@ -795,13 +970,27 @@ ReplaceSnapshot replaceSnapshot(const std::wstring& path) {
     snapshot.filesystem = jsonString(filesystem, "type");
     snapshot.driveType = jsonString(filesystem, "driveType");
     snapshot.attributes = jsonString(file, "attributes");
+    snapshot.attributeBits = std::stoul(snapshot.attributes, nullptr, 16);
     snapshot.remote = jsonBoolean(filesystem, "remote");
     snapshot.normalFile = jsonBoolean(file, "normalFile");
     snapshot.reparsePoint = jsonBoolean(file, "reparsePoint");
     snapshot.ownerFingerprint = jsonString(security, "ownerFingerprint");
     snapshot.groupFingerprint = jsonString(security, "groupFingerprint");
     snapshot.daclFingerprint = jsonString(security, "daclFingerprint");
+    snapshot.daclPresent = jsonBoolean(security, "daclPresent");
     snapshot.daclProtected = jsonBoolean(security, "daclProtected");
+    snapshot.daclAutoInherited = jsonBoolean(security, "daclAutoInherited");
+    snapshot.daclAutoInheritRequired = jsonBoolean(security, "daclAutoInheritRequired");
+    snapshot.daclRevision = jsonUint32(security, "daclRevision");
+    snapshot.aceCount = jsonUint32(security, "aceCount");
+    snapshot.explicitAceCount = jsonUint32(security, "explicitAceCount");
+    snapshot.inheritedAceCount = jsonUint32(security, "inheritedAceCount");
+    snapshot.aceSemanticsComplete = jsonBoolean(security, "aceSemanticsComplete");
+    snapshot.aceOrderDigest = jsonString(security, "aceOrderDigest");
+    snapshot.semanticAceSetDigest = jsonString(security, "semanticAceSetDigest");
+    snapshot.accessMaskDigest = jsonString(security, "accessMaskDigest");
+    snapshot.inheritanceFlagsDigest = jsonString(security, "inheritanceFlagsDigest");
+    snapshot.trusteeDigest = jsonString(security, "trusteeDigest");
     snapshot.adsDigest = jsonString(streams, "digest");
     snapshot.adsInventoryDigest = jsonString(streams, "inventoryDigest");
     snapshot.compressionFormat = jsonString(compression, "format");
@@ -907,17 +1096,50 @@ struct ValidationDiagnostic {
     bool ownerMatches = false;
     bool groupMatches = false;
     bool daclMatches = false;
+    bool daclPresentMatches = false;
     bool protectedAclMatches = false;
+    bool daclAutoInheritedMatches = false;
+    bool daclAutoInheritRequiredMatches = false;
+    bool daclRevisionMatches = false;
+    bool aceCountMatches = false;
+    bool explicitAceCountMatches = false;
+    bool inheritedAceCountMatches = false;
+    bool aceOrderDigestMatches = false;
+    bool semanticAceSetDigestMatches = false;
+    bool accessMaskDigestMatches = false;
+    bool inheritanceFlagsDigestMatches = false;
+    bool trusteeDigestMatches = false;
+    bool aceSemanticsCompleteMatches = false;
     bool adsMatches = false;
     bool attributesMatch = false;
+    bool readonlyAttributeMatches = false;
+    bool hiddenAttributeMatches = false;
+    bool systemAttributeMatches = false;
+    bool archiveAttributeMatches = false;
+    bool temporaryAttributeMatches = false;
+    bool sparseAttributeMatches = false;
+    bool compressedAttributeMatches = false;
+    bool encryptedAttributeMatches = false;
+    bool otherAttributesMatch = false;
     bool linkCountMatches = false;
     bool regularFileMatches = false;
     bool reparseStateMatches = false;
     bool metadataFingerprintMatches = false;
+    std::uint32_t actualAceCount = 0;
+    std::uint32_t expectedAceCount = 0;
+    std::uint32_t actualExplicitAceCount = 0;
+    std::uint32_t expectedExplicitAceCount = 0;
+    std::uint32_t actualInheritedAceCount = 0;
+    std::uint32_t expectedInheritedAceCount = 0;
 
     bool allMatch() const {
         return contentHashMatches && sizeMatches && volumeMatches && identityMatches && ownerMatches &&
-            groupMatches && daclMatches && protectedAclMatches && adsMatches && attributesMatch &&
+            groupMatches && daclMatches && daclPresentMatches && protectedAclMatches &&
+            daclAutoInheritedMatches && daclAutoInheritRequiredMatches && daclRevisionMatches &&
+            aceCountMatches && explicitAceCountMatches && inheritedAceCountMatches &&
+            aceOrderDigestMatches && semanticAceSetDigestMatches && accessMaskDigestMatches &&
+            inheritanceFlagsDigestMatches && trusteeDigestMatches && aceSemanticsCompleteMatches &&
+            adsMatches && attributesMatch &&
             linkCountMatches && regularFileMatches && reparseStateMatches && metadataFingerprintMatches;
     }
 };
@@ -934,13 +1156,47 @@ ValidationDiagnostic compareSnapshots(const std::string& stage, const std::strin
     result.ownerMatches = actual.ownerFingerprint == expected.ownerFingerprint;
     result.groupMatches = actual.groupFingerprint == expected.groupFingerprint;
     result.daclMatches = actual.daclFingerprint == expected.daclFingerprint;
+    result.daclPresentMatches = actual.daclPresent == expected.daclPresent;
     result.protectedAclMatches = actual.daclProtected == expected.daclProtected;
+    result.daclAutoInheritedMatches = actual.daclAutoInherited == expected.daclAutoInherited;
+    result.daclAutoInheritRequiredMatches = actual.daclAutoInheritRequired == expected.daclAutoInheritRequired;
+    result.daclRevisionMatches = actual.daclRevision == expected.daclRevision;
+    result.aceCountMatches = actual.aceCount == expected.aceCount;
+    result.explicitAceCountMatches = actual.explicitAceCount == expected.explicitAceCount;
+    result.inheritedAceCountMatches = actual.inheritedAceCount == expected.inheritedAceCount;
+    result.aceOrderDigestMatches = actual.aceOrderDigest == expected.aceOrderDigest;
+    result.semanticAceSetDigestMatches = actual.semanticAceSetDigest == expected.semanticAceSetDigest;
+    result.accessMaskDigestMatches = actual.accessMaskDigest == expected.accessMaskDigest;
+    result.inheritanceFlagsDigestMatches = actual.inheritanceFlagsDigest == expected.inheritanceFlagsDigest;
+    result.trusteeDigestMatches = actual.trusteeDigest == expected.trusteeDigest;
+    result.aceSemanticsCompleteMatches = actual.aceSemanticsComplete && expected.aceSemanticsComplete;
     result.adsMatches = actual.adsDigest == expected.adsDigest && actual.adsInventoryDigest == expected.adsInventoryDigest;
     result.attributesMatch = actual.attributes == expected.attributes;
+    const auto attributeMatches = [&actual, &expected](DWORD mask) {
+        return (actual.attributeBits & mask) == (expected.attributeBits & mask);
+    };
+    result.readonlyAttributeMatches = attributeMatches(FILE_ATTRIBUTE_READONLY);
+    result.hiddenAttributeMatches = attributeMatches(FILE_ATTRIBUTE_HIDDEN);
+    result.systemAttributeMatches = attributeMatches(FILE_ATTRIBUTE_SYSTEM);
+    result.archiveAttributeMatches = attributeMatches(FILE_ATTRIBUTE_ARCHIVE);
+    result.temporaryAttributeMatches = attributeMatches(FILE_ATTRIBUTE_TEMPORARY);
+    result.sparseAttributeMatches = attributeMatches(FILE_ATTRIBUTE_SPARSE_FILE);
+    result.compressedAttributeMatches = attributeMatches(FILE_ATTRIBUTE_COMPRESSED);
+    result.encryptedAttributeMatches = attributeMatches(FILE_ATTRIBUTE_ENCRYPTED);
+    constexpr DWORD classifiedAttributes = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM |
+        FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_SPARSE_FILE |
+        FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_ENCRYPTED;
+    result.otherAttributesMatch = (actual.attributeBits & ~classifiedAttributes) == (expected.attributeBits & ~classifiedAttributes);
     result.linkCountMatches = actual.linkCount == expected.linkCount;
     result.regularFileMatches = actual.normalFile == expected.normalFile;
     result.reparseStateMatches = actual.reparsePoint == expected.reparsePoint;
     result.metadataFingerprintMatches = actual.metadataFingerprint == expected.metadataFingerprint;
+    result.actualAceCount = actual.aceCount;
+    result.expectedAceCount = expected.aceCount;
+    result.actualExplicitAceCount = actual.explicitAceCount;
+    result.expectedExplicitAceCount = expected.explicitAceCount;
+    result.actualInheritedAceCount = actual.inheritedAceCount;
+    result.expectedInheritedAceCount = expected.inheritedAceCount;
     return result;
 }
 
@@ -958,13 +1214,38 @@ std::string validationDiagnosticsJson(const std::vector<ValidationDiagnostic>& d
             << ",\"ownerMatches\":" << (item.ownerMatches ? "true" : "false")
             << ",\"groupMatches\":" << (item.groupMatches ? "true" : "false")
             << ",\"daclMatches\":" << (item.daclMatches ? "true" : "false")
+            << ",\"daclPresentMatches\":" << (item.daclPresentMatches ? "true" : "false")
             << ",\"protectedAclMatches\":" << (item.protectedAclMatches ? "true" : "false")
+            << ",\"daclAutoInheritedMatches\":" << (item.daclAutoInheritedMatches ? "true" : "false")
+            << ",\"daclAutoInheritRequiredMatches\":" << (item.daclAutoInheritRequiredMatches ? "true" : "false")
+            << ",\"daclRevisionMatches\":" << (item.daclRevisionMatches ? "true" : "false")
+            << ",\"aceCountMatches\":" << (item.aceCountMatches ? "true" : "false")
+            << ",\"explicitAceCountMatches\":" << (item.explicitAceCountMatches ? "true" : "false")
+            << ",\"inheritedAceCountMatches\":" << (item.inheritedAceCountMatches ? "true" : "false")
+            << ",\"aceOrderDigestMatches\":" << (item.aceOrderDigestMatches ? "true" : "false")
+            << ",\"semanticAceSetDigestMatches\":" << (item.semanticAceSetDigestMatches ? "true" : "false")
+            << ",\"accessMaskDigestMatches\":" << (item.accessMaskDigestMatches ? "true" : "false")
+            << ",\"inheritanceFlagsDigestMatches\":" << (item.inheritanceFlagsDigestMatches ? "true" : "false")
+            << ",\"trusteeDigestMatches\":" << (item.trusteeDigestMatches ? "true" : "false")
+            << ",\"aceSemanticsCompleteMatches\":" << (item.aceSemanticsCompleteMatches ? "true" : "false")
             << ",\"adsMatches\":" << (item.adsMatches ? "true" : "false")
             << ",\"attributesMatch\":" << (item.attributesMatch ? "true" : "false")
+            << ",\"readonlyAttributeMatches\":" << (item.readonlyAttributeMatches ? "true" : "false")
+            << ",\"hiddenAttributeMatches\":" << (item.hiddenAttributeMatches ? "true" : "false")
+            << ",\"systemAttributeMatches\":" << (item.systemAttributeMatches ? "true" : "false")
+            << ",\"archiveAttributeMatches\":" << (item.archiveAttributeMatches ? "true" : "false")
+            << ",\"temporaryAttributeMatches\":" << (item.temporaryAttributeMatches ? "true" : "false")
+            << ",\"sparseAttributeMatches\":" << (item.sparseAttributeMatches ? "true" : "false")
+            << ",\"compressedAttributeMatches\":" << (item.compressedAttributeMatches ? "true" : "false")
+            << ",\"encryptedAttributeMatches\":" << (item.encryptedAttributeMatches ? "true" : "false")
+            << ",\"otherAttributesMatch\":" << (item.otherAttributesMatch ? "true" : "false")
             << ",\"linkCountMatches\":" << (item.linkCountMatches ? "true" : "false")
             << ",\"regularFileMatches\":" << (item.regularFileMatches ? "true" : "false")
             << ",\"reparseStateMatches\":" << (item.reparseStateMatches ? "true" : "false")
-            << ",\"metadataFingerprintMatches\":" << (item.metadataFingerprintMatches ? "true" : "false") << '}';
+            << ",\"metadataFingerprintMatches\":" << (item.metadataFingerprintMatches ? "true" : "false")
+            << ",\"actualAceCount\":" << item.actualAceCount << ",\"expectedAceCount\":" << item.expectedAceCount
+            << ",\"actualExplicitAceCount\":" << item.actualExplicitAceCount << ",\"expectedExplicitAceCount\":" << item.expectedExplicitAceCount
+            << ",\"actualInheritedAceCount\":" << item.actualInheritedAceCount << ",\"expectedInheritedAceCount\":" << item.expectedInheritedAceCount << '}';
     }
     output << ']';
     return output.str();

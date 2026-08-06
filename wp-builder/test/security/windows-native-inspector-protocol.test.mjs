@@ -118,8 +118,18 @@ test('protocol v1 inspect remains stable and protocol v2 defines replace snapsho
     assert.deepEqual(v2.$defs.validationDiagnostic.required, [
         'stage', 'subject', 'contentHashMatches', 'sizeMatches', 'volumeMatches',
         'identityMatches', 'ownerMatches', 'groupMatches', 'daclMatches',
-        'protectedAclMatches', 'adsMatches', 'attributesMatch', 'linkCountMatches',
-        'regularFileMatches', 'reparseStateMatches', 'metadataFingerprintMatches'
+        'daclPresentMatches', 'protectedAclMatches', 'daclAutoInheritedMatches',
+        'daclAutoInheritRequiredMatches', 'daclRevisionMatches', 'aceCountMatches',
+        'explicitAceCountMatches', 'inheritedAceCountMatches', 'aceOrderDigestMatches',
+        'semanticAceSetDigestMatches', 'accessMaskDigestMatches',
+        'inheritanceFlagsDigestMatches', 'trusteeDigestMatches', 'aceSemanticsCompleteMatches',
+        'adsMatches', 'attributesMatch', 'readonlyAttributeMatches', 'hiddenAttributeMatches',
+        'systemAttributeMatches', 'archiveAttributeMatches', 'temporaryAttributeMatches',
+        'sparseAttributeMatches', 'compressedAttributeMatches', 'encryptedAttributeMatches',
+        'otherAttributesMatch', 'linkCountMatches', 'regularFileMatches', 'reparseStateMatches',
+        'metadataFingerprintMatches', 'actualAceCount', 'expectedAceCount',
+        'actualExplicitAceCount', 'expectedExplicitAceCount', 'actualInheritedAceCount',
+        'expectedInheritedAceCount'
     ]);
     assert.equal(v2.$defs.validationDiagnostic.additionalProperties, false);
     assert.ok(v2.oneOf.find(entry => entry.title === 'Replace response').required.includes('validation'));

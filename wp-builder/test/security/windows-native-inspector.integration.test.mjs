@@ -173,22 +173,57 @@ const validationBooleanFields = [
     'ownerMatches',
     'groupMatches',
     'daclMatches',
+    'daclPresentMatches',
     'protectedAclMatches',
+    'daclAutoInheritedMatches',
+    'daclAutoInheritRequiredMatches',
+    'daclRevisionMatches',
+    'aceCountMatches',
+    'explicitAceCountMatches',
+    'inheritedAceCountMatches',
+    'aceOrderDigestMatches',
+    'semanticAceSetDigestMatches',
+    'accessMaskDigestMatches',
+    'inheritanceFlagsDigestMatches',
+    'trusteeDigestMatches',
+    'aceSemanticsCompleteMatches',
     'adsMatches',
     'attributesMatch',
+    'readonlyAttributeMatches',
+    'hiddenAttributeMatches',
+    'systemAttributeMatches',
+    'archiveAttributeMatches',
+    'temporaryAttributeMatches',
+    'sparseAttributeMatches',
+    'compressedAttributeMatches',
+    'encryptedAttributeMatches',
+    'otherAttributesMatch',
     'linkCountMatches',
     'regularFileMatches',
     'reparseStateMatches',
     'metadataFingerprintMatches'
 ];
 
+const validationCountFields = [
+    'actualAceCount',
+    'expectedAceCount',
+    'actualExplicitAceCount',
+    'expectedExplicitAceCount',
+    'actualInheritedAceCount',
+    'expectedInheritedAceCount'
+];
+
 function reportSafeValidation(fixture, response) {
     assert.ok(Array.isArray(response.validation), `${fixture}: validation diagnostics are missing`);
     for (const item of response.validation) {
-        assert.deepEqual(Object.keys(item).sort(), ['stage', 'subject', ...validationBooleanFields].sort());
+        assert.deepEqual(Object.keys(item).sort(), ['stage', 'subject', ...validationBooleanFields, ...validationCountFields].sort());
         assert.match(item.stage, /^post-(?:replace|rollback)$/);
         assert.match(item.subject, /^(?:target|backup)$/);
         for (const field of validationBooleanFields) assert.equal(typeof item[field], 'boolean', `${fixture}: ${field}`);
+        for (const field of validationCountFields) {
+            assert.equal(Number.isSafeInteger(item[field]), true, `${fixture}: ${field}`);
+            assert.ok(item[field] >= 0, `${fixture}: ${field}`);
+        }
     }
     const sanitized = JSON.stringify(response.validation);
     assert.doesNotMatch(sanitized, /S-\d+(?:-\d+){1,}/);
@@ -460,6 +495,7 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         const before = inspect(fixture.target);
         assert.equal(before.security.daclProtected, true);
         const result = runReplace(fixture);
+        reportSafeValidation('protected-explicit-acl', result.response);
         assert.equal(result.status, 0, JSON.stringify(result.response));
         const after = inspect(fixture.target);
         assert.equal(after.security.daclFingerprint, before.security.daclFingerprint);
