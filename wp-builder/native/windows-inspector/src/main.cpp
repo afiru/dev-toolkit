@@ -21,7 +21,8 @@
 
 namespace {
 
-constexpr int kSchemaVersion = 1;
+constexpr int kMinimumSchemaVersion = 1;
+constexpr int kMaximumSchemaVersion = 2;
 constexpr char kHelperVersion[] = "0.1.0";
 constexpr char kAdapter[] = "windows-native-inspector-v1";
 constexpr std::size_t kMaxInputBytes = 1024 * 1024;
@@ -552,9 +553,11 @@ std::string driveTypeName(UINT type) {
     }
 }
 
-std::string errorResponse(const std::string& requestId, const std::string& code, DWORD windowsError, const std::string& phase) {
-    return "{\"schemaVersion\":1,\"helperVersion\":\"" + std::string(kHelperVersion) + "\",\"requestId\":" + escapeJson(requestId) +
-        ",\"ok\":false,\"operation\":\"inspect\",\"error\":{\"code\":" + escapeJson(code) +
+std::string errorResponse(int schemaVersion, const std::string& operation, const std::string& requestId,
+    const std::string& code, DWORD windowsError, const std::string& phase) {
+    return "{\"schemaVersion\":" + std::to_string(schemaVersion) + ",\"helperVersion\":\"" + std::string(kHelperVersion) +
+        "\",\"requestId\":" + escapeJson(requestId) + ",\"ok\":false,\"operation\":" + escapeJson(operation) +
+        ",\"error\":{\"code\":" + escapeJson(code) +
         ",\"windowsError\":" + std::to_string(windowsError) + ",\"phase\":" + escapeJson(phase) + ",\"retryable\":false}}";
 }
 
@@ -566,7 +569,7 @@ struct InspectionError : std::runtime_error {
         : std::runtime_error(message), code(std::move(errorCode)), windowsError(nativeError), phase(std::move(errorPhase)) {}
 };
 
-std::string inspect(const std::wstring& targetPath, const std::string& requestId) {
+std::string inspect(const std::wstring& targetPath, const std::string& requestId, int schemaVersion) {
     const DWORD access = GENERIC_READ | READ_CONTROL;
     Handle file(CreateFileW(targetPath.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
@@ -690,7 +693,7 @@ std::string inspect(const std::wstring& targetPath, const std::string& requestId
     blocking << ']';
 
     std::ostringstream output;
-    output << "{\"schemaVersion\":1,\"helperVersion\":\"" << kHelperVersion << "\",\"requestId\":" << escapeJson(requestId)
+    output << "{\"schemaVersion\":" << schemaVersion << ",\"helperVersion\":\"" << kHelperVersion << "\",\"requestId\":" << escapeJson(requestId)
         << ",\"ok\":true,\"operation\":\"inspect\",\"adapter\":\"" << kAdapter << "\",\"architecture\":" << escapeJson(architecture())
         << ",\"filesystem\":{\"type\":" << escapeJson(filesystem) << ",\"remote\":" << (remote ? "true" : "false")
         << ",\"driveType\":" << escapeJson(driveTypeName(driveType)) << ",\"volumeSerial\":" << escapeJson(volumeSerialText)
@@ -717,19 +720,28 @@ int main() {
     std::ios::sync_with_stdio(false);
     std::string input((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
     std::string requestId;
+    std::string operation = "inspect";
+    int schemaVersion = kMinimumSchemaVersion;
     try {
         if (input.empty() || input.size() > kMaxInputBytes) throw InspectionError("INVALID_JSON", ERROR_INVALID_DATA, "protocol", "Request size is invalid.");
         const JsonValue request = JsonParser(input).parse();
         const JsonValue& schema = required(request, "schemaVersion", JsonValue::Type::Number);
-        const JsonValue& operation = required(request, "operation", JsonValue::Type::String);
+        const JsonValue& operationValue = required(request, "operation", JsonValue::Type::String);
         const JsonValue& requestIdValue = required(request, "requestId", JsonValue::Type::String);
         requestId = requestIdValue.text;
+        operation = operationValue.text;
         if (requestId.empty() || requestId.size() > 128) throw InspectionError("INVALID_REQUEST", ERROR_INVALID_DATA, "protocol", "requestId is invalid.");
-        if (schema.text != "1") {
-            std::cout << errorResponse(requestId, "HELPER_SCHEMA_UNSUPPORTED", ERROR_REVISION_MISMATCH, "protocol");
+        if (schema.text == "1") schemaVersion = 1;
+        else if (schema.text == "2") schemaVersion = 2;
+        else {
+            std::cout << errorResponse(schemaVersion, operation, requestId, "HELPER_SCHEMA_UNSUPPORTED", ERROR_REVISION_MISMATCH, "protocol");
             return 2;
         }
-        if (operation.text != "inspect") throw InspectionError("INVALID_REQUEST", ERROR_INVALID_FUNCTION, "protocol", "Only inspect is supported.");
+        if (schemaVersion < kMinimumSchemaVersion || schemaVersion > kMaximumSchemaVersion) {
+            std::cout << errorResponse(schemaVersion, operation, requestId, "HELPER_SCHEMA_UNSUPPORTED", ERROR_REVISION_MISMATCH, "protocol");
+            return 2;
+        }
+        if (operation != "inspect") throw InspectionError("OPERATION_UNSUPPORTED", ERROR_INVALID_FUNCTION, "protocol", "Only inspect is supported.");
         const JsonValue& target = required(request, "target", JsonValue::Type::Object);
         const std::string targetPathUtf8 = required(target, "path", JsonValue::Type::String).text;
         if (targetPathUtf8.empty()) throw InspectionError("INVALID_PATH", ERROR_INVALID_NAME, "protocol", "Target path is empty.");
@@ -737,13 +749,13 @@ int main() {
         const bool driveAbsolute = targetPath.size() >= 3 && targetPath[1] == L':' && (targetPath[2] == L'\\' || targetPath[2] == L'/');
         const bool uncAbsolute = targetPath.size() >= 2 && targetPath[0] == L'\\' && targetPath[1] == L'\\';
         if (!driveAbsolute && !uncAbsolute) throw InspectionError("INVALID_PATH", ERROR_BAD_PATHNAME, "protocol", "Target path must be absolute.");
-        std::cout << inspect(targetPath, requestId);
+        std::cout << inspect(targetPath, requestId, schemaVersion);
         return 0;
     } catch (const InspectionError& error) {
-        std::cout << errorResponse(requestId, error.code, error.windowsError, error.phase);
+        std::cout << errorResponse(schemaVersion, operation, requestId, error.code, error.windowsError, error.phase);
         return 2;
     } catch (const std::exception&) {
-        std::cout << errorResponse(requestId, "INSPECTION_FAILED", GetLastError(), "inspection");
+        std::cout << errorResponse(schemaVersion, operation, requestId, "INSPECTION_FAILED", GetLastError(), "inspection");
         return 2;
     }
 }

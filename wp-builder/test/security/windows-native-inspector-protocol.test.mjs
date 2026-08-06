@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
     fingerprintWindowsDacl,
     fingerprintWindowsSid,
@@ -87,9 +90,25 @@ function runWithResponse(makeResponse, options = {}) {
 }
 
 test('Windows native inspector accepts a valid protocol v1 response', () => {
-    const result = runWithResponse(request => responseFor(request));
+    const result = runWithResponse(request => {
+        assert.equal(request.schemaVersion, 1);
+        assert.equal(request.operation, 'inspect');
+        return responseFor(request);
+    });
     assert.equal(result.status, 'inspected');
     assert.equal(result.response.capabilities.completeForReplace, false);
+});
+
+test('protocol v1 and inspection-only v2 schemas remain distinct and valid JSON', () => {
+    const testDirectory = path.dirname(fileURLToPath(import.meta.url));
+    const protocolDirectory = path.resolve(testDirectory, '..', '..', 'native', 'windows-inspector');
+    const v1 = JSON.parse(fs.readFileSync(path.join(protocolDirectory, 'protocol-schema-v1.json'), 'utf8'));
+    const v2 = JSON.parse(fs.readFileSync(path.join(protocolDirectory, 'protocol-schema-v2.json'), 'utf8'));
+    assert.equal(v1.oneOf[0].properties.schemaVersion.const, 1);
+    assert.equal(v2.oneOf[0].properties.schemaVersion.const, 2);
+    assert.equal(v1.oneOf[0].properties.operation.const, 'inspect');
+    assert.equal(v2.oneOf[0].properties.operation.const, 'inspect');
+    assert.doesNotMatch(JSON.stringify(v2), /ReplaceFileW|lpReplacedFileName/);
 });
 
 test('Windows native inspector rejects schema mismatch', () => {

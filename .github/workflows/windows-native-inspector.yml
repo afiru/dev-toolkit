@@ -14,10 +14,10 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
           cache: npm
@@ -39,6 +39,7 @@ jobs:
           $artifactRoot = Join-Path $env:RUNNER_TEMP 'wpb-windows-native-inspector'
           $binDir = Join-Path $artifactRoot 'bin'
           $objDir = Join-Path $artifactRoot 'obj'
+          $sdkSelectionFile = Join-Path $artifactRoot 'windows-sdk-selection.txt'
           New-Item -ItemType Directory -Force -Path $binDir, $objDir | Out-Null
           $arguments = @(
             $project,
@@ -49,6 +50,7 @@ jobs:
             '/p:PlatformToolset=v143',
             "/p:OutDir=$binDir\",
             "/p:IntDir=$objDir\",
+            "/p:WpbWindowsSdkSelectionFile=$sdkSelectionFile",
             '/p:TargetName=wpb-windows-inspector',
             "/bl:$artifactRoot\windows-native-inspector.binlog"
           )
@@ -56,10 +58,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE." }
           $helperPath = Join-Path $binDir 'wpb-windows-inspector.exe'
           if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) { throw 'The helper EXE was not produced.' }
+          if (-not (Test-Path -LiteralPath $sdkSelectionFile -PathType Leaf)) { throw 'MSBuild did not report its Windows SDK selection.' }
           "WPB_TEST_WINDOWS_INSPECTOR_PATH=$helperPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WPB_NATIVE_ARTIFACT_ROOT=$artifactRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WPB_NATIVE_HELPER_PATH=$helperPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WPB_VS_PATH=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WPB_WINDOWS_SDK_SELECTION_FILE=$sdkSelectionFile" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Validate PE security and dependencies
         shell: pwsh
@@ -118,42 +122,32 @@ jobs:
           $helperVersionMatch = [regex]::Match($source, 'kHelperVersion\[\]\s*=\s*"([^"]+)"')
           if (-not $helperVersionMatch.Success) { throw 'helperVersion could not be read from the source.' }
           $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
-          $sdkCandidates = @(Get-ChildItem -LiteralPath $sdkRoot -Directory | ForEach-Object {
-            $parsedVersion = $null
-            if ($_.Name -match '^\d+\.\d+\.\d+\.\d+$' -and
-                [System.Version]::TryParse($_.Name, [ref]$parsedVersion)) {
-              [pscustomobject]@{ Name = $_.Name; Version = $parsedVersion }
-            }
-          })
-          if ($sdkCandidates.Count -eq 0) {
-            throw "No versioned Windows SDK Include directory was found under $sdkRoot."
+          $sdkSelection = (Get-Content -LiteralPath $env:WPB_WINDOWS_SDK_SELECTION_FILE -Raw).Trim()
+          $sdkSelectionMatch = [regex]::Match(
+            $sdkSelection,
+            '^WindowsTargetPlatformVersion=([^|]+)\|WindowsSDKVersion=([^|]+)$'
+          )
+          if (-not $sdkSelectionMatch.Success) {
+            throw "MSBuild returned an invalid Windows SDK selection record."
           }
-          $sdkVersionSource = 'latest-versioned-include-directory'
-          $sdkBuildSelectionVerified = $false
-          $environmentSdkVersion = ([string]$env:WindowsSDKVersion).Trim().TrimEnd('\')
-          if ($environmentSdkVersion) {
-            $parsedEnvironmentVersion = $null
-            if ($environmentSdkVersion -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
-                -not [System.Version]::TryParse($environmentSdkVersion, [ref]$parsedEnvironmentVersion)) {
-              throw "WindowsSDKVersion is not a supported four-part version: $environmentSdkVersion"
-            }
-            $selectedSdk = $sdkCandidates |
-              Where-Object { $_.Version -eq $parsedEnvironmentVersion } |
-              Select-Object -First 1
-            if (-not $selectedSdk) {
-              throw "WindowsSDKVersion does not match an installed Include directory: $environmentSdkVersion"
-            }
-            $sdkVersionSource = 'WindowsSDKVersion-environment-candidate'
-          } else {
-            $selectedSdk = $sdkCandidates |
-              Sort-Object Version -Descending |
-              Select-Object -First 1
+          $targetPlatformVersion = $sdkSelectionMatch.Groups[1].Value.Trim().TrimEnd('\')
+          $sdkVersion = $sdkSelectionMatch.Groups[2].Value.Trim().TrimEnd('\')
+          $parsedSdkVersion = $null
+          if ($sdkVersion -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
+              -not [System.Version]::TryParse($sdkVersion, [ref]$parsedSdkVersion)) {
+            throw "MSBuild reported an invalid WindowsTargetPlatformVersion: $sdkVersion"
           }
-          $sdkVersion = $selectedSdk.Name
+          $sdkInclude = Join-Path $sdkRoot $sdkVersion
+          if (-not (Test-Path -LiteralPath $sdkInclude -PathType Container)) {
+            throw "MSBuild-selected Windows SDK Include directory does not exist: $sdkVersion"
+          }
+          $sdkVersionSource = 'msbuild-resolved-WindowsSDKVersion'
+          $sdkBuildSelectionVerified = $true
           $sdkSummary = [ordered]@{
             version = $sdkVersion
             source = $sdkVersionSource
             buildSelectionVerified = $sdkBuildSelectionVerified
+            windowsTargetPlatformVersion = $targetPlatformVersion
           }
           $summaryPath = Join-Path $env:WPB_NATIVE_ARTIFACT_ROOT 'validation-summary.json'
           $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
@@ -164,8 +158,9 @@ jobs:
             manifestSchemaVersion = 1
             helperName = 'wpb-windows-inspector'
             helperVersion = $helperVersionMatch.Groups[1].Value
-            protocolSchemaVersions = @(1)
+            protocolSchemaVersions = @(1, 2)
             adapter = 'windows-native-inspector-v1'
+            platform = 'win32'
             architecture = 'x64'
             sourceRevision = $env:GITHUB_SHA
             completeForReplace = $false
@@ -183,12 +178,15 @@ jobs:
               windowsSdkVersion = $sdkVersion
               windowsSdkVersionSource = $sdkVersionSource
               windowsSdkBuildSelectionVerified = $sdkBuildSelectionVerified
+              windowsTargetPlatformVersion = $targetPlatformVersion
               runtimeLibrary = 'MultiThreaded (/MT)'
             }
             securityFlags = @('/GS', '/guard:cf', '/DYNAMICBASE', '/HIGHENTROPYVA', '/NXCOMPAT')
             signed = $false
           }
-          $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $env:WPB_NATIVE_ARTIFACT_ROOT 'wpb-windows-inspector.manifest.json') -Encoding utf8
+          $manifestPath = Join-Path $env:WPB_NATIVE_ARTIFACT_ROOT 'wpb-windows-inspector.manifest.json'
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+          "WPB_TEST_WINDOWS_INSPECTOR_MANIFEST_PATH=$manifestPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Check PHP runtime
         shell: pwsh
@@ -197,6 +195,7 @@ jobs:
           php -r "if (!extension_loaded('tokenizer')) { fwrite(STDERR, 'tokenizer unavailable'); exit(1); }"
 
       - name: Diagnose PowerShell module-path inheritance
+        if: ${{ false }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -525,7 +524,7 @@ jobs:
 
       - name: Upload unsigned inspection-only helper
         if: ${{ always() && env.WPB_NATIVE_ARTIFACT_ROOT != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-native-inspector-x64-${{ github.sha }}
           path: |

@@ -55,5 +55,12 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
   </ItemGroup>
+  <Target Name="WriteWpbWindowsSdkSelection" AfterTargets="PrepareForBuild" Condition="'$(WpbWindowsSdkSelectionFile)' != ''">
+    <WriteLinesToFile
+      File="$(WpbWindowsSdkSelectionFile)"
+      Lines="WindowsTargetPlatformVersion=$(WindowsTargetPlatformVersion)|WindowsSDKVersion=$(WindowsSDKVersion)"
+      Overwrite="true"
+      Encoding="UTF-8" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

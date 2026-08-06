@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import {
     inspectWindowsNative
 } from '../../lib/security/windows-native-inspector.js';
+import { validateWindowsHelperTrust } from '../../lib/security/windows-helper-trust.js';
 import {
     createTempWorkspace,
     writeTempFile
@@ -150,6 +152,67 @@ function inspectRaw(file, requestId = 'raw-leak-check') {
     assert.doesNotMatch(output, /(?:^|[,{\s])(?:O|G|D|S):(?:AI|AR|P|\()/);
     return { response, output };
 }
+
+function runRawRequest(request) {
+    const result = spawnSync(helperPath, [], {
+        input: JSON.stringify(request),
+        encoding: 'utf8',
+        windowsHide: true
+    });
+    assert.equal(result.stderr, '');
+    return { status: result.status, response: JSON.parse(result.stdout.trim()) };
+}
+
+test('built helper trust manifest is valid for inspect and ineligible for replace', {
+    skip: process.platform !== 'win32'
+        ? 'Windows-only helper trust integration fixture.'
+        : !process.env.WPB_TEST_WINDOWS_INSPECTOR_MANIFEST_PATH
+            ? 'Built helper manifest path is unavailable.'
+            : false
+}, () => {
+    const result = validateWindowsHelperTrust({
+        helperPath,
+        expectedBundledPath: helperPath,
+        manifestPath: process.env.WPB_TEST_WINDOWS_INSPECTOR_MANIFEST_PATH,
+        expectedSourceRevision: process.env.GITHUB_SHA,
+        platform: 'win32',
+        architecture: 'x64'
+    });
+    assert.equal(result.trustedForInspection, true, JSON.stringify(result.trustReasons));
+    assert.equal(result.trustedForReplace, false);
+    assert.ok(result.replaceBlockingReasons.some(reason => reason.code === 'WINDOWS_HELPER_REPLACE_INCOMPLETE'));
+});
+
+test('real helper accepts protocol v2 inspect but explicitly rejects replace', integrationOptions, () => {
+    const root = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'wpb-protocol-v2-'));
+    const file = path.join(root, 'case.php');
+    fs.writeFileSync(file, '<?php echo 1; ?>');
+    try {
+        const inspectResult = runRawRequest({
+            schemaVersion: 2,
+            operation: 'inspect',
+            requestId: 'protocol-v2-inspect',
+            target: { path: path.resolve(file) }
+        });
+        assert.equal(inspectResult.status, 0);
+        assert.equal(inspectResult.response.schemaVersion, 2);
+        assert.equal(inspectResult.response.ok, true);
+        assert.equal(inspectResult.response.capabilities.completeForReplace, false);
+
+        const replaceResult = runRawRequest({
+            schemaVersion: 2,
+            operation: 'replace',
+            requestId: 'protocol-v2-replace',
+            target: { path: path.resolve(file) }
+        });
+        assert.equal(replaceResult.status, 2);
+        assert.equal(replaceResult.response.ok, false);
+        assert.equal(replaceResult.response.operation, 'replace');
+        assert.equal(replaceResult.response.error.code, 'OPERATION_UNSUPPORTED');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
 
 function powershell(script) {
     return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {

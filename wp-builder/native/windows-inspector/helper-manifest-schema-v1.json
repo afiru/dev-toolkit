@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wp-builder.local/windows-inspector/helper-manifest-schema-v1.json",
+  "title": "wp-builder Windows native helper manifest v1",
+  "type": "object",
+  "required": [
+    "manifestSchemaVersion",
+    "helperName",
+    "helperVersion",
+    "protocolSchemaVersions",
+    "adapter",
+    "platform",
+    "architecture",
+    "sourceRevision",
+    "completeForReplace",
+    "artifact",
+    "toolchain",
+    "signed"
+  ],
+  "properties": {
+    "manifestSchemaVersion": { "const": 1 },
+    "helperName": { "const": "wpb-windows-inspector" },
+    "helperVersion": { "type": "string", "minLength": 1 },
+    "protocolSchemaVersions": {
+      "type": "array",
+      "items": { "enum": [1, 2] },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "adapter": { "const": "windows-native-inspector-v1" },
+    "platform": { "const": "win32" },
+    "architecture": { "const": "x64" },
+    "sourceRevision": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+    "completeForReplace": { "type": "boolean" },
+    "artifact": {
+      "type": "object",
+      "required": ["sha256", "size"],
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "runner": { "type": "object" },
+    "toolchain": {
+      "type": "object",
+      "required": ["windowsSdkVersion", "windowsSdkBuildSelectionVerified"],
+      "properties": {
+        "windowsSdkVersion": { "type": "string" },
+        "windowsSdkVersionSource": { "type": "string" },
+        "windowsSdkBuildSelectionVerified": { "const": true }
+      },
+      "additionalProperties": true
+    },
+    "securityFlags": { "type": "array", "items": { "type": "string" } },
+    "signed": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

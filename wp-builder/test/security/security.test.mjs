@@ -7,3 +7,4 @@ await import('./fix-apply.test.mjs');
 await import('./linux-rollback.test.mjs');
 await import('./cli.test.mjs');
 await import('./temp-safety.test.mjs');
+await import('./windows-helper-trust.test.mjs');
