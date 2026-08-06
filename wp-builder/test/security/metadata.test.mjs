@@ -24,10 +24,24 @@ import {
 
 const source = Buffer.from("<p><?= SCF::get('title') ?></p>\n");
 
+function environmentEntries(environment, name) {
+    const normalizedName = name.toLowerCase();
+    return Object.entries(environment).filter(([key]) => key.toLowerCase() === normalizedName);
+}
+
+function createTestWindowsPowerShellEnvironment(sourceEnvironment = process.env) {
+    const childEnvironment = { ...sourceEnvironment };
+    for (const key of Object.keys(childEnvironment)) {
+        if (key.toLowerCase() === 'psmodulepath') delete childEnvironment[key];
+    }
+    return childEnvironment;
+}
+
 function powershell(script) {
     return spawnSync('powershell.exe', ['-NoProfile', '-Command', script], {
         encoding: 'utf8',
-        windowsHide: true
+        windowsHide: true,
+        env: createTestWindowsPowerShellEnvironment()
     });
 }
 
@@ -106,6 +120,43 @@ test('Windows PowerShell child environment removes only PSModulePath case-insens
         );
         assert.equal(childEnvironment.WPB_SECURITY_METADATA_TARGET, 'C:\\fixture\\case.php');
     });
+
+    for (const pathKey of ['PATH', 'Path', 'path', 'PaTh']) {
+        await t.test(`preserves ${pathKey}`, () => {
+            const sourceEnvironment = {
+                [pathKey]: 'C:\\Windows\\System32',
+                PSModulePath: 'C:\\Program Files\\PowerShell\\7\\Modules'
+            };
+            const childEnvironment = createWindowsPowerShellEnvironment(
+                sourceEnvironment,
+                'C:\\fixture\\case.php'
+            );
+
+            assert.deepEqual(environmentEntries(childEnvironment, 'PATH'), [[
+                pathKey,
+                sourceEnvironment[pathKey]
+            ]]);
+            assert.deepEqual(environmentEntries(childEnvironment, 'PSModulePath'), []);
+        });
+    }
+});
+
+test('test PowerShell child environment removes PSModulePath without mutating its source', () => {
+    const sourceEnvironment = {
+        Path: 'C:\\Windows\\System32',
+        PsMoDuLePaTh: 'C:\\Program Files\\PowerShell\\7\\Modules',
+        WinPSModulePath: 'C:\\WindowsPowerShell\\Modules'
+    };
+    const originalEnvironment = { ...sourceEnvironment };
+    const childEnvironment = createTestWindowsPowerShellEnvironment(sourceEnvironment);
+
+    assert.deepEqual(sourceEnvironment, originalEnvironment);
+    assert.deepEqual(environmentEntries(childEnvironment, 'PATH'), [[
+        'Path',
+        sourceEnvironment.Path
+    ]]);
+    assert.deepEqual(environmentEntries(childEnvironment, 'PSModulePath'), []);
+    assert.equal(childEnvironment.WinPSModulePath, sourceEnvironment.WinPSModulePath);
 });
 
 test('Windows metadata inspection passes a sanitized copy to powershell.exe', () => {
@@ -156,9 +207,10 @@ test('Windows metadata inspection passes a sanitized copy to powershell.exe', ()
         false
     );
     for (const key of ['PATH', 'SystemRoot', 'TEMP', 'TMP', 'USERPROFILE', 'WinPSModulePath']) {
-        if (Object.hasOwn(process.env, key)) {
-            assert.equal(spawnCall.options.env[key], process.env[key]);
-        }
+        assert.deepEqual(
+            environmentEntries(spawnCall.options.env, key),
+            environmentEntries(process.env, key)
+        );
     }
     assert.equal(spawnCall.options.env.WPB_SECURITY_METADATA_TARGET, 'C:\\fixture\\case.php');
     assert.deepEqual({ ...process.env }, originalEnvironment);
