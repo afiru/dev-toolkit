@@ -244,10 +244,14 @@ function reportSafeValidation(fixture, response) {
     console.log(`WPB_VALIDATION ${fixture} ${sanitized}`);
 }
 
-function assertKnownInheritedDaclLimitation(fixture, result) {
+function assertKnownInheritedDaclLimitation(fixture, result, {
+    forwardDaclRestorationFailed = false
+} = {}) {
     reportSafeValidation(fixture, result.response);
     assert.equal(result.status, 2, JSON.stringify(result.response));
+    assert.equal(result.response.ok, false);
     assert.equal(result.response.error.code, 'WINDOWS_RECOVERY_REQUIRED');
+    assert.equal(result.response.error.phase, 'rollback-validation');
     const forwardTarget = result.response.validation.find(item => (
         item.stage === 'post-replace' && item.subject === 'target'
     ));
@@ -262,22 +266,43 @@ function assertKnownInheritedDaclLimitation(fixture, result) {
         assert.equal(item.daclAutoInheritedMatches, false);
         assert.equal(item.daclMatches, false);
         assert.equal(item.metadataFingerprintMatches, false);
-        for (const field of [
-            'daclPresentMatches',
-            'daclNullMatches',
-            'protectedAclMatches',
-            'daclAutoInheritRequiredMatches',
-            'daclRevisionMatches',
-            'aceCountMatches',
-            'explicitAceCountMatches',
-            'inheritedAceCountMatches',
-            'aceOrderDigestMatches',
-            'semanticAceSetDigestMatches',
-            'accessMaskDigestMatches',
-            'inheritanceFlagsDigestMatches',
-            'trusteeDigestMatches',
-            'aceSemanticsCompleteMatches'
-        ]) assert.equal(item[field], true, `${fixture}: ${field}`);
+    }
+    const stableDaclFields = [
+        'daclPresentMatches',
+        'daclNullMatches',
+        'protectedAclMatches',
+        'daclAutoInheritRequiredMatches',
+        'daclRevisionMatches',
+        'inheritedAceCountMatches',
+        'aceSemanticsCompleteMatches'
+    ];
+    for (const item of [forwardTarget, rollbackTarget]) {
+        for (const field of stableDaclFields) {
+            assert.equal(item[field], true, `${fixture}: ${field}`);
+        }
+    }
+    const semanticDaclFields = [
+        'aceCountMatches',
+        'explicitAceCountMatches',
+        'aceOrderDigestMatches',
+        'semanticAceSetDigestMatches',
+        'accessMaskDigestMatches',
+        'inheritanceFlagsDigestMatches',
+        'trusteeDigestMatches'
+    ];
+    for (const field of semanticDaclFields) {
+        assert.equal(rollbackTarget[field], true, `${fixture}: rollback ${field}`);
+    }
+    if (forwardDaclRestorationFailed) {
+        for (const field of semanticDaclFields) {
+            assert.equal(forwardTarget[field], false, `${fixture}: post-replace ${field}`);
+        }
+        assert.ok(forwardTarget.actualAceCount > forwardTarget.expectedAceCount);
+        assert.ok(forwardTarget.actualExplicitAceCount > forwardTarget.expectedExplicitAceCount);
+    } else {
+        for (const field of semanticDaclFields) {
+            assert.equal(forwardTarget[field], true, `${fixture}: ${field}`);
+        }
     }
     assert.ok(backup, `${fixture}: exact recovery backup diagnostic is missing`);
     for (const field of validationBooleanFields) {
@@ -703,14 +728,16 @@ test('Experimental ReplaceFileW characterization', experimentalIntegrationOption
         assert.equal(rollbackDiagnostic.attributesMatch, true);
     });
 
-    await t.test('DACL restoration failure rolls back only after complete metadata restoration', () => {
+    await t.test('DACL restoration failure remains recovery-required after incomplete restoration', () => {
         const fixture = files('dacl-restore-failure');
         const before = inspect(fixture.target);
         const original = fs.readFileSync(fixture.target);
         const result = runReplace(fixture, {
             env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'dacl-restoration-failure' }
         });
-        assertKnownInheritedDaclLimitation('dacl-restoration-failure', result);
+        assertKnownInheritedDaclLimitation('dacl-restoration-failure', result, {
+            forwardDaclRestorationFailed: true
+        });
         assert.deepEqual(fs.readFileSync(fixture.target), original);
         assert.notEqual(inspect(fixture.target).metadataFingerprint, before.metadataFingerprint);
     });
