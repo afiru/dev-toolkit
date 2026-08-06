@@ -39,7 +39,7 @@ jobs:
           $artifactRoot = Join-Path $env:RUNNER_TEMP 'wpb-windows-native-inspector'
           $binDir = Join-Path $artifactRoot 'bin'
           $objDir = Join-Path $artifactRoot 'obj'
-          $sdkSelectionFile = Join-Path $artifactRoot 'windows-sdk-selection.txt'
+          $sdkEvidenceLog = Join-Path $env:RUNNER_TEMP 'wpb-windows-sdk-evidence.log'
           New-Item -ItemType Directory -Force -Path $binDir, $objDir | Out-Null
           $arguments = @(
             $project,
@@ -50,20 +50,21 @@ jobs:
             '/p:PlatformToolset=v143',
             "/p:OutDir=$binDir\",
             "/p:IntDir=$objDir\",
-            "/p:WpbWindowsSdkSelectionFile=$sdkSelectionFile",
+            '/p:WpbEmitSdkEvidence=true',
             '/p:TargetName=wpb-windows-inspector',
             "/bl:$artifactRoot\windows-native-inspector.binlog"
           )
-          & $msbuild @arguments
-          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE." }
+          & $msbuild @arguments *> $sdkEvidenceLog
+          $msbuildExitCode = $LASTEXITCODE
+          if ($msbuildExitCode -ne 0) { throw "MSBuild failed with exit code $msbuildExitCode; inspect the uploaded binlog." }
           $helperPath = Join-Path $binDir 'wpb-windows-inspector.exe'
           if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) { throw 'The helper EXE was not produced.' }
-          if (-not (Test-Path -LiteralPath $sdkSelectionFile -PathType Leaf)) { throw 'MSBuild did not report its Windows SDK selection.' }
+          if (-not (Test-Path -LiteralPath $sdkEvidenceLog -PathType Leaf)) { throw 'MSBuild did not produce an SDK evidence log.' }
           "WPB_TEST_WINDOWS_INSPECTOR_PATH=$helperPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WPB_NATIVE_ARTIFACT_ROOT=$artifactRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WPB_NATIVE_HELPER_PATH=$helperPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WPB_VS_PATH=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "WPB_WINDOWS_SDK_SELECTION_FILE=$sdkSelectionFile" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WPB_WINDOWS_SDK_EVIDENCE_LOG=$sdkEvidenceLog" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Validate PE security and dependencies
         shell: pwsh
@@ -122,73 +123,42 @@ jobs:
           $helperVersionMatch = [regex]::Match($source, 'kHelperVersion\[\]\s*=\s*"([^"]+)"')
           if (-not $helperVersionMatch.Success) { throw 'helperVersion could not be read from the source.' }
           $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
-          $sdkSelectionLines = @(Get-Content -LiteralPath $env:WPB_WINDOWS_SDK_SELECTION_FILE |
-            ForEach-Object { $_.Trim().TrimStart([char]0xFEFF) } |
-            Where-Object { $_ -ne '' })
-          $sdkSelection = @{}
-          foreach ($line in $sdkSelectionLines) {
-            $match = [regex]::Match($line, '^(RecordTarget|WindowsTargetPlatformVersion|WindowsSDKVersion|UCRTVersion)=(.*)$')
-            if (-not $match.Success) {
-              throw 'MSBuild returned a malformed Windows SDK selection record.'
-            }
-            $name = $match.Groups[1].Value
-            if ($sdkSelection.ContainsKey($name)) {
-              throw "MSBuild returned a duplicate Windows SDK selection property: $name"
-            }
-            $sdkSelection[$name] = $match.Groups[2].Value.Trim()
+          $sdkLibRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Lib'
+          $sdkEvidence = Get-Content -LiteralPath $env:WPB_WINDOWS_SDK_EVIDENCE_LOG -Raw
+          $includeVersions = @([regex]::Matches(
+            $sdkEvidence,
+            '(?i)\\Windows Kits\\10\\Include\\(?<version>\d+\.\d+\.\d+\.\d+)\\'
+          ) | ForEach-Object { $_.Groups['version'].Value } | Sort-Object -Unique)
+          $libVersions = @([regex]::Matches(
+            $sdkEvidence,
+            '(?i)\\Windows Kits\\10\\Lib\\(?<version>\d+\.\d+\.\d+\.\d+)\\'
+          ) | ForEach-Object { $_.Groups['version'].Value } | Sort-Object -Unique)
+          Write-Host "Windows SDK Include versions used: $($includeVersions.Count)"
+          Write-Host "Windows SDK Lib versions used: $($libVersions.Count)"
+          if ($includeVersions.Count -ne 1 -or $libVersions.Count -ne 1) {
+            throw 'The executed CL/Link tasks did not provide one unambiguous Windows SDK version.'
           }
-          Write-Host "SDK selection record lines: $($sdkSelectionLines.Count)"
-          foreach ($name in @('RecordTarget', 'WindowsTargetPlatformVersion', 'WindowsSDKVersion', 'UCRTVersion')) {
-            $displayValue = if ($sdkSelection.ContainsKey($name) -and $sdkSelection[$name] -ne '') {
-              $sdkSelection[$name]
-            } else {
-              '<empty>'
-            }
-            Write-Host "${name}: $displayValue"
+          if ($includeVersions[0] -ne $libVersions[0]) {
+            throw 'The executed CL and Link tasks used different Windows SDK versions.'
           }
-          if ([string]$sdkSelection['RecordTarget'] -ne 'Build') {
-            throw 'MSBuild SDK selection record was not produced after the Build target.'
-          }
-
-          function ConvertTo-WpbSdkVersion([string]$Name, [string]$Value, [bool]$Required) {
-            $normalized = $Value.Trim().TrimEnd('\', '/')
-            if ($normalized -eq '') {
-              if ($Required) { throw "MSBuild did not report $Name." }
-              return $null
-            }
-            $parsed = $null
-            if ($normalized -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
-                -not [System.Version]::TryParse($normalized, [ref]$parsed)) {
-              throw "MSBuild reported an invalid ${Name}: $normalized"
-            }
-            return $normalized
-          }
-
-          $targetPlatformVersion = ConvertTo-WpbSdkVersion `
-            'WindowsTargetPlatformVersion' `
-            ([string]$sdkSelection['WindowsTargetPlatformVersion']) `
-            $true
-          foreach ($relatedName in @('WindowsSDKVersion', 'UCRTVersion')) {
-            $relatedVersion = ConvertTo-WpbSdkVersion `
-              $relatedName `
-              ([string]$sdkSelection[$relatedName]) `
-              $false
-            if ($null -ne $relatedVersion -and $relatedVersion -ne $targetPlatformVersion) {
-              throw "MSBuild SDK selection disagrees: WindowsTargetPlatformVersion=$targetPlatformVersion, ${relatedName}=$relatedVersion"
+          $sdkVersion = $includeVersions[0]
+          Write-Host "Verified Windows SDK version: $sdkVersion"
+          foreach ($sdkDirectory in @(
+            (Join-Path $sdkRoot $sdkVersion),
+            (Join-Path $sdkLibRoot $sdkVersion)
+          )) {
+            if (-not (Test-Path -LiteralPath $sdkDirectory -PathType Container)) {
+              throw 'A Windows SDK directory proven by CL/Link evidence does not exist.'
             }
           }
-          $sdkVersion = $targetPlatformVersion
-          $sdkInclude = Join-Path $sdkRoot $sdkVersion
-          if (-not (Test-Path -LiteralPath $sdkInclude -PathType Container)) {
-            throw "MSBuild-selected Windows SDK Include directory does not exist: $sdkVersion"
-          }
-          $sdkVersionSource = 'msbuild-resolved-WindowsTargetPlatformVersion'
+          $sdkVersionSource = 'executed-cl-showIncludes+link-verbose-lib'
           $sdkBuildSelectionVerified = $true
           $sdkSummary = [ordered]@{
             version = $sdkVersion
             source = $sdkVersionSource
             buildSelectionVerified = $sdkBuildSelectionVerified
-            windowsTargetPlatformVersion = $targetPlatformVersion
+            includeVersion = $includeVersions[0]
+            libVersion = $libVersions[0]
           }
           $summaryPath = Join-Path $env:WPB_NATIVE_ARTIFACT_ROOT 'validation-summary.json'
           $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
@@ -219,7 +189,8 @@ jobs:
               windowsSdkVersion = $sdkVersion
               windowsSdkVersionSource = $sdkVersionSource
               windowsSdkBuildSelectionVerified = $sdkBuildSelectionVerified
-              windowsTargetPlatformVersion = $targetPlatformVersion
+              windowsSdkIncludeVersion = $includeVersions[0]
+              windowsSdkLibVersion = $libVersions[0]
               runtimeLibrary = 'MultiThreaded (/MT)'
             }
             securityFlags = @('/GS', '/guard:cf', '/DYNAMICBASE', '/HIGHENTROPYVA', '/NXCOMPAT')

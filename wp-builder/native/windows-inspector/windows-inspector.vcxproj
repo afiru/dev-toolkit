@@ -41,6 +41,7 @@
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;_WIN32_WINNT=0x0A00;WINVER=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalOptions Condition="'$(WpbEmitSdkEvidence)'=='true'">/showIncludes %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -50,17 +51,11 @@
       <DataExecutionPrevention>true</DataExecutionPrevention>
       <ControlFlowGuard>Guard</ControlFlowGuard>
       <AdditionalDependencies>Advapi32.lib;Bcrypt.lib;Mpr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions Condition="'$(WpbEmitSdkEvidence)'=='true'">/VERBOSE:LIB %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
   </ItemGroup>
-  <Target Name="WriteWpbWindowsSdkSelection" AfterTargets="Build" Condition="'$(WpbWindowsSdkSelectionFile)' != ''">
-    <WriteLinesToFile
-      File="$(WpbWindowsSdkSelectionFile)"
-      Lines="RecordTarget=Build;WindowsTargetPlatformVersion=$(WindowsTargetPlatformVersion);WindowsSDKVersion=$(WindowsSDKVersion);UCRTVersion=$(UCRTVersion)"
-      Overwrite="true"
-      Encoding="UTF-8" />
-  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
