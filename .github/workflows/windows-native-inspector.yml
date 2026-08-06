@@ -51,6 +51,7 @@ jobs:
             "/p:OutDir=$binDir\",
             "/p:IntDir=$objDir\",
             '/p:WpbEmitSdkEvidence=true',
+            '/p:WpbEnableNativeTestHooks=true',
             '/p:TargetName=wpb-windows-inspector',
             "/bl:$artifactRoot\windows-native-inspector.binlog"
           )
@@ -111,6 +112,7 @@ jobs:
             checks = $checks
             dependencies = $dlls
             completeForReplace = $false
+            nativeTestHooksEnabled = $true
           }
           $summary | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $env:WPB_NATIVE_ARTIFACT_ROOT 'validation-summary.json') -Encoding utf8
           "WPB_MSVC_VERSION=$($toolset.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append

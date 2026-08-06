@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
     inspectWindowsNative
@@ -153,14 +154,38 @@ function inspectRaw(file, requestId = 'raw-leak-check') {
     return { response, output };
 }
 
-function runRawRequest(request) {
+function runRawRequest(request, env = process.env) {
     const result = spawnSync(helperPath, [], {
         input: JSON.stringify(request),
         encoding: 'utf8',
-        windowsHide: true
+        windowsHide: true,
+        env
     });
     assert.equal(result.stderr, '');
     return { status: result.status, response: JSON.parse(result.stdout.trim()) };
+}
+
+function replaceEndpoint(file, response = inspect(file)) {
+    return {
+        path: path.resolve(file),
+        expected: {
+            contentSha256: `sha256:${createHash('sha256').update(fs.readFileSync(file)).digest('hex')}`,
+            size: String(fs.statSync(file).size),
+            identity: response.file.identity,
+            metadataFingerprint: response.metadataFingerprint
+        }
+    };
+}
+
+function replaceRequest(target, replacement, backup, requestId = 'replace-fixture') {
+    return {
+        schemaVersion: 2,
+        operation: 'replace',
+        requestId,
+        target: replaceEndpoint(target),
+        replacement: replaceEndpoint(replacement),
+        backup: { path: path.resolve(backup) }
+    };
 }
 
 test('built helper trust manifest is valid for inspect and ineligible for replace', {
@@ -183,7 +208,7 @@ test('built helper trust manifest is valid for inspect and ineligible for replac
     assert.ok(result.replaceBlockingReasons.some(reason => reason.code === 'WINDOWS_HELPER_REPLACE_INCOMPLETE'));
 });
 
-test('real helper accepts protocol v2 inspect but explicitly rejects replace', integrationOptions, () => {
+test('real helper accepts protocol v2 inspect and rejects incomplete replace requests', integrationOptions, () => {
     const root = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'wpb-protocol-v2-'));
     const file = path.join(root, 'case.php');
     fs.writeFileSync(file, '<?php echo 1; ?>');
@@ -208,7 +233,16 @@ test('real helper accepts protocol v2 inspect but explicitly rejects replace', i
         assert.equal(replaceResult.status, 2);
         assert.equal(replaceResult.response.ok, false);
         assert.equal(replaceResult.response.operation, 'replace');
-        assert.equal(replaceResult.response.error.code, 'OPERATION_UNSUPPORTED');
+        assert.equal(replaceResult.response.error.code, 'INSPECTION_FAILED');
+
+        const unsupported = runRawRequest({
+            schemaVersion: 2,
+            operation: 'delete',
+            requestId: 'protocol-v2-unsupported',
+            target: { path: path.resolve(file) }
+        });
+        assert.equal(unsupported.status, 2);
+        assert.equal(unsupported.response.error.code, 'OPERATION_UNSUPPORTED');
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -335,5 +369,237 @@ test('Windows native inspector real filesystem fixtures', integrationOptions, as
             spawnSync('icacls.exe', [file, '/remove:d', `*${sid}`], { encoding: 'utf8', windowsHide: true });
             spawnSync('icacls.exe', [file, '/reset'], { encoding: 'utf8', windowsHide: true });
         }
+    });
+});
+
+test('Windows native helper ReplaceFileW transaction fixtures', integrationOptions, async t => {
+    const root = createTempWorkspace(t, 'windows-native-replace');
+    const files = name => ({
+        target: writeTempFile(root, `${name}-target.php`, `original-${name}`),
+        replacement: writeTempFile(root, `${name}-replacement.php`, `desired-${name}`),
+        backup: path.join(root, `${name}-rollback.wpb`)
+    });
+    const runReplace = (fixture, options = {}) => {
+        const request = options.request ?? replaceRequest(
+            fixture.target,
+            fixture.replacement,
+            fixture.backup,
+            options.requestId
+        );
+        return runRawRequest(request, options.env ?? process.env);
+    };
+
+    await t.test('normal ReplaceFileW commits replacement identity and removes backup', () => {
+        const fixture = files('normal');
+        const beforeTarget = inspect(fixture.target);
+        const beforeReplacement = inspect(fixture.replacement);
+        const result = runReplace(fixture);
+        assert.equal(result.status, 0, JSON.stringify(result.response));
+        assert.equal(result.response.transaction.state, 'COMMITTED');
+        assert.equal(result.response.transaction.replaceFileFlags, 0);
+        assert.equal(result.response.transaction.backupRemoved, true);
+        assert.equal(fs.readFileSync(fixture.target, 'utf8'), 'desired-normal');
+        assert.equal(fs.existsSync(fixture.replacement), false);
+        assert.equal(fs.existsSync(fixture.backup), false);
+        const after = inspect(fixture.target);
+        assert.deepEqual(after.file.identity, beforeReplacement.file.identity);
+        assert.equal(after.security.ownerFingerprint, beforeTarget.security.ownerFingerprint);
+        assert.equal(after.security.groupFingerprint, beforeTarget.security.groupFingerprint);
+        assert.equal(after.security.daclFingerprint, beforeTarget.security.daclFingerprint);
+    });
+
+    await t.test('inherited ACL is preserved', () => {
+        const fixture = files('inherited');
+        const before = inspect(fixture.target);
+        assert.equal(before.security.daclProtected, false);
+        const result = runReplace(fixture);
+        assert.equal(result.status, 0, JSON.stringify(result.response));
+        const after = inspect(fixture.target);
+        assert.equal(after.security.daclFingerprint, before.security.daclFingerprint);
+        assert.equal(after.security.daclProtected, false);
+    });
+
+    await t.test('protected explicit ACL is preserved', () => {
+        const fixture = files('protected');
+        const setup = spawnSync('icacls.exe', [fixture.target, '/inheritance:d'], { encoding: 'utf8', windowsHide: true });
+        assert.equal(setup.status, 0, setup.stderr);
+        const before = inspect(fixture.target);
+        assert.equal(before.security.daclProtected, true);
+        const result = runReplace(fixture);
+        assert.equal(result.status, 0, JSON.stringify(result.response));
+        const after = inspect(fixture.target);
+        assert.equal(after.security.daclFingerprint, before.security.daclFingerprint);
+        assert.equal(after.security.daclProtected, true);
+    });
+
+    await t.test('an Administrators-owned target is validated by fingerprint, not an owner allowlist', t => {
+        const fixture = files('administrators-owner');
+        const setup = spawnSync('icacls.exe', [fixture.target, '/setowner', '*S-1-5-32-544'], {
+            encoding: 'utf8',
+            windowsHide: true
+        });
+        if (setup.status !== 0) return t.skip('The runner account cannot create an Administrators-owned fixture.');
+        const before = inspect(fixture.target);
+        const result = runReplace(fixture);
+        assert.equal(result.status, 0, JSON.stringify(result.response));
+        assert.equal(inspect(fixture.target).security.ownerFingerprint, before.security.ownerFingerprint);
+    });
+
+    await t.test('ADS inventory and content digest are preserved', () => {
+        const fixture = files('ads');
+        fs.writeFileSync(`${fixture.target}:wpb-phase-b`, 'sensitive-stream-value');
+        const before = inspect(fixture.target);
+        const result = runReplace(fixture);
+        assert.equal(result.status, 0, JSON.stringify(result.response));
+        const after = inspect(fixture.target);
+        assert.equal(after.streams.count, 1);
+        assert.equal(after.streams.digest, before.streams.digest);
+        assert.equal(after.streams.inventoryDigest, before.streams.inventoryDigest);
+    });
+
+    await t.test('readonly target either preserves metadata or fails without changing content', () => {
+        const fixture = files('readonly-replace');
+        const setup = powershell(`(Get-Item -LiteralPath ${psQuote(fixture.target)} -Force).IsReadOnly = $true`);
+        assert.equal(setup.status, 0, setup.stderr);
+        const original = fs.readFileSync(fixture.target);
+        try {
+            const result = runReplace(fixture);
+            if (result.status === 0) {
+                assert.equal(inspect(fixture.target).file.readonly, true);
+            } else {
+                assert.equal(result.response.error.code, 'WINDOWS_REPLACE_FAILED');
+                assert.deepEqual(fs.readFileSync(fixture.target), original);
+            }
+        } finally {
+            if (fs.existsSync(fixture.target)) powershell(`(Get-Item -LiteralPath ${psQuote(fixture.target)} -Force).IsReadOnly = $false`);
+            if (fs.existsSync(fixture.backup)) powershell(`(Get-Item -LiteralPath ${psQuote(fixture.backup)} -Force).IsReadOnly = $false`);
+        }
+    });
+
+    await t.test('stale content hash blocks before ReplaceFileW', () => {
+        const fixture = files('stale-hash');
+        const request = replaceRequest(fixture.target, fixture.replacement, fixture.backup);
+        fs.appendFileSync(fixture.target, '-changed');
+        const result = runReplace(fixture, { request });
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'STALE_FILE');
+        assert.equal(fs.existsSync(fixture.backup), false);
+    });
+
+    await t.test('stale identity blocks before ReplaceFileW', () => {
+        const fixture = files('stale-identity');
+        const request = replaceRequest(fixture.target, fixture.replacement, fixture.backup);
+        fs.unlinkSync(fixture.target);
+        fs.writeFileSync(fixture.target, 'original-stale-identity');
+        const result = runReplace(fixture, { request });
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'STALE_FILE');
+    });
+
+    await t.test('stale ACL blocks before ReplaceFileW', () => {
+        const fixture = files('stale-acl');
+        const request = replaceRequest(fixture.target, fixture.replacement, fixture.backup);
+        const setup = spawnSync('icacls.exe', [fixture.target, '/inheritance:d'], { encoding: 'utf8', windowsHide: true });
+        assert.equal(setup.status, 0, setup.stderr);
+        const result = runReplace(fixture, { request });
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'STALE_FILE');
+    });
+
+    await t.test('stale ADS blocks before ReplaceFileW', () => {
+        const fixture = files('stale-ads');
+        const request = replaceRequest(fixture.target, fixture.replacement, fixture.backup);
+        fs.writeFileSync(`${fixture.target}:late-stream`, 'late');
+        const result = runReplace(fixture, { request });
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'STALE_FILE');
+    });
+
+    await t.test('replacement mismatch blocks before ReplaceFileW', () => {
+        const fixture = files('replacement-mismatch');
+        const request = replaceRequest(fixture.target, fixture.replacement, fixture.backup);
+        fs.appendFileSync(fixture.replacement, '-changed');
+        const result = runReplace(fixture, { request });
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'STALE_FILE');
+        assert.match(fs.readFileSync(fixture.target, 'utf8'), /^original-/);
+    });
+
+    await t.test('hard-link target is blocked', () => {
+        const fixture = files('hardlink-replace');
+        fs.linkSync(fixture.target, path.join(root, 'hardlink-replace-copy.php'));
+        const result = runReplace(fixture);
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'HARD_LINK_TARGET');
+        assert.equal(fs.existsSync(fixture.backup), false);
+    });
+
+    await t.test('reparse target is blocked when symlink creation is available', t => {
+        const realTarget = writeTempFile(root, 'reparse-real.php', 'original-reparse');
+        const replacement = writeTempFile(root, 'reparse-replacement.php', 'desired-reparse');
+        const target = path.join(root, 'reparse-link.php');
+        try {
+            fs.symlinkSync(realTarget, target, 'file');
+        } catch (error) {
+            if (error.code === 'EPERM') return t.skip('Symlink creation requires Windows Developer Mode or privilege.');
+            throw error;
+        }
+        const fixture = { target, replacement, backup: path.join(root, 'reparse-backup.wpb') };
+        const result = runReplace(fixture);
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'REPARSE_POINT_UNSUPPORTED');
+    });
+
+    await t.test('final hash mismatch triggers validated rollback', () => {
+        const fixture = files('rollback-hash');
+        const original = fs.readFileSync(fixture.target);
+        const originalIdentity = inspect(fixture.target).file.identity;
+        const result = runReplace(fixture, {
+            env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'final-hash-mismatch' }
+        });
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
+        assert.deepEqual(fs.readFileSync(fixture.target), original);
+        assert.deepEqual(inspect(fixture.target).file.identity, originalIdentity);
+        assert.equal(fs.existsSync(fixture.backup), false);
+        assert.equal(fs.existsSync(fixture.replacement), false);
+    });
+
+    await t.test('final metadata mismatch triggers validated rollback', () => {
+        const fixture = files('rollback-metadata');
+        const before = inspect(fixture.target);
+        const result = runReplace(fixture, {
+            env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'final-metadata-mismatch' }
+        });
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
+        const after = inspect(fixture.target);
+        assert.equal(after.metadataFingerprint, before.metadataFingerprint);
+    });
+
+    await t.test('unverifiable backup produces recovery-required without destructive fallback', () => {
+        const fixture = files('rollback-failure');
+        const original = fs.readFileSync(fixture.target);
+        const result = runReplace(fixture, {
+            env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'rollback-failure' }
+        });
+        assert.equal(result.status, 2);
+        assert.equal(result.response.error.code, 'WINDOWS_RECOVERY_REQUIRED');
+        assert.equal(fs.existsSync(fixture.backup), true);
+        assert.deepEqual(fs.readFileSync(fixture.backup), original);
+    });
+
+    await t.test('replace responses do not leak paths or security metadata', () => {
+        const fixture = files('leak');
+        const result = spawnSync(helperPath, [], {
+            input: JSON.stringify(replaceRequest(fixture.target, fixture.replacement, fixture.backup)),
+            encoding: 'utf8',
+            windowsHide: true
+        });
+        assert.equal(result.status, 0, result.stdout);
+        assert.equal(result.stderr, '');
+        assert.equal(result.stdout.includes(root), false);
+        assert.doesNotMatch(result.stdout, /S-\d+(?:-\d+){1,}/);
+        assert.doesNotMatch(result.stdout, /(?:^|[,\{\s])(?:O|G|D|S):(?:AI|AR|P|\()/);
     });
 });

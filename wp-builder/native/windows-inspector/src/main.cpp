@@ -23,7 +23,7 @@ namespace {
 
 constexpr int kMinimumSchemaVersion = 1;
 constexpr int kMaximumSchemaVersion = 2;
-constexpr char kHelperVersion[] = "0.1.0";
+constexpr char kHelperVersion[] = "0.2.0";
 constexpr char kAdapter[] = "windows-native-inspector-v1";
 constexpr std::size_t kMaxInputBytes = 1024 * 1024;
 constexpr std::size_t kMaxStreamInfoBytes = 16 * 1024 * 1024;
@@ -714,6 +714,311 @@ std::string inspect(const std::wstring& targetPath, const std::string& requestId
     return output.str();
 }
 
+struct ReplaceSnapshot {
+    std::string contentSha256;
+    std::string size;
+    std::string identityVolume;
+    std::string fileId;
+    std::string metadataFingerprint;
+    std::string preservedMetadataFingerprint;
+    std::string volumeFingerprint;
+    std::string filesystem;
+    std::string driveType;
+    std::string attributes;
+    std::vector<std::string> blockingReasons;
+    bool remote = false;
+    bool normalFile = false;
+    bool reparsePoint = false;
+    std::uint64_t linkCount = 0;
+};
+
+std::string hashFileContent(const std::wstring& path) {
+    Handle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (file.value == INVALID_HANDLE_VALUE) {
+        throw InspectionError("INSPECTION_FAILED", GetLastError(), "content-hash", "Content hash open failed.");
+    }
+    Sha256 hash;
+    std::array<std::uint8_t, 64 * 1024> buffer{};
+    while (true) {
+        DWORD read = 0;
+        if (!ReadFile(file.value, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr)) {
+            throw InspectionError("INSPECTION_FAILED", GetLastError(), "content-hash", "Content hash read failed.");
+        }
+        if (read == 0) break;
+        hash.update(buffer.data(), read);
+    }
+    return "sha256:" + hash.finish();
+}
+
+std::string jsonString(const JsonValue& object, const std::string& key) {
+    return required(object, key, JsonValue::Type::String).text;
+}
+
+bool jsonBoolean(const JsonValue& object, const std::string& key) {
+    return required(object, key, JsonValue::Type::Boolean).boolean;
+}
+
+ReplaceSnapshot replaceSnapshot(const std::wstring& path) {
+    const JsonValue root = JsonParser(inspect(path, "internal-replace-snapshot", 2)).parse();
+    const JsonValue& filesystem = required(root, "filesystem", JsonValue::Type::Object);
+    const JsonValue& file = required(root, "file", JsonValue::Type::Object);
+    const JsonValue& identity = required(file, "identity", JsonValue::Type::Object);
+    const JsonValue& security = required(root, "security", JsonValue::Type::Object);
+    const JsonValue& streams = required(root, "streams", JsonValue::Type::Object);
+    const JsonValue& compression = required(root, "compression", JsonValue::Type::Object);
+    const JsonValue& encryption = required(root, "encryption", JsonValue::Type::Object);
+    const JsonValue& reasons = required(root, "blockingReasons", JsonValue::Type::Array);
+
+    ReplaceSnapshot snapshot;
+    snapshot.contentSha256 = hashFileContent(path);
+    snapshot.size = jsonString(file, "size");
+    snapshot.identityVolume = jsonString(identity, "volumeSerial");
+    snapshot.fileId = jsonString(identity, "fileId");
+    snapshot.metadataFingerprint = jsonString(root, "metadataFingerprint");
+    snapshot.volumeFingerprint = jsonString(filesystem, "volumeFingerprint");
+    snapshot.filesystem = jsonString(filesystem, "type");
+    snapshot.driveType = jsonString(filesystem, "driveType");
+    snapshot.attributes = jsonString(file, "attributes");
+    snapshot.remote = jsonBoolean(filesystem, "remote");
+    snapshot.normalFile = jsonBoolean(file, "normalFile");
+    snapshot.reparsePoint = jsonBoolean(file, "reparsePoint");
+    snapshot.linkCount = std::stoull(jsonString(file, "linkCount"));
+    for (const JsonValue& reason : reasons.array) snapshot.blockingReasons.push_back(jsonString(reason, "code"));
+
+    std::string preserved = "schema=wpb-windows-preserved-metadata-v1";
+    const auto add = [&preserved](const std::string& name, const std::string& value) {
+        preserved.push_back('\0');
+        preserved += name + "=" + value;
+    };
+    add("attributes", snapshot.attributes);
+    add("dacl", jsonString(security, "daclFingerprint"));
+    add("daclProtected", jsonBoolean(security, "daclProtected") ? "true" : "false");
+    add("owner", jsonString(security, "ownerFingerprint"));
+    add("group", jsonString(security, "groupFingerprint"));
+    add("ads", jsonString(streams, "digest"));
+    add("adsInventory", jsonString(streams, "inventoryDigest"));
+    add("compression", jsonString(compression, "format"));
+    add("encrypted", jsonBoolean(encryption, "encrypted") ? "true" : "false");
+    snapshot.preservedMetadataFingerprint = digestTagged("wpb-windows-preserved-metadata-v1", preserved);
+    return snapshot;
+}
+
+struct ExpectedSnapshot {
+    std::string contentSha256;
+    std::string size;
+    std::string identityVolume;
+    std::string fileId;
+    std::string metadataFingerprint;
+};
+
+ExpectedSnapshot expectedSnapshot(const JsonValue& endpoint) {
+    const JsonValue& expected = required(endpoint, "expected", JsonValue::Type::Object);
+    const JsonValue& identity = required(expected, "identity", JsonValue::Type::Object);
+    return {
+        jsonString(expected, "contentSha256"),
+        jsonString(expected, "size"),
+        jsonString(identity, "volumeSerial"),
+        jsonString(identity, "fileId"),
+        jsonString(expected, "metadataFingerprint")
+    };
+}
+
+bool matchesExpected(const ReplaceSnapshot& actual, const ExpectedSnapshot& expected) {
+    return actual.contentSha256 == expected.contentSha256 && actual.size == expected.size &&
+        actual.identityVolume == expected.identityVolume && actual.fileId == expected.fileId &&
+        actual.metadataFingerprint == expected.metadataFingerprint;
+}
+
+bool sameSnapshot(const ReplaceSnapshot& left, const ReplaceSnapshot& right) {
+    return left.contentSha256 == right.contentSha256 && left.size == right.size &&
+        left.identityVolume == right.identityVolume && left.fileId == right.fileId &&
+        left.metadataFingerprint == right.metadataFingerprint;
+}
+
+bool sameIdentity(const ReplaceSnapshot& left, const ReplaceSnapshot& right) {
+    return left.identityVolume == right.identityVolume && left.fileId == right.fileId;
+}
+
+std::wstring absoluteLocalPath(const std::string& utf8Path) {
+    if (utf8Path.empty()) throw InspectionError("INVALID_PATH", ERROR_INVALID_NAME, "protocol", "Path is empty.");
+    const std::wstring path = utf8ToWide(utf8Path);
+    if (path.size() < 3 || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/')) {
+        throw InspectionError("INVALID_PATH", ERROR_BAD_PATHNAME, "protocol", "Replace paths must be drive-absolute.");
+    }
+    const DWORD requiredLength = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (requiredLength == 0) throw InspectionError("INVALID_PATH", GetLastError(), "protocol", "Path normalization failed.");
+    std::vector<WCHAR> buffer(requiredLength);
+    if (GetFullPathNameW(path.c_str(), requiredLength, buffer.data(), nullptr) == 0) {
+        throw InspectionError("INVALID_PATH", GetLastError(), "protocol", "Path normalization failed.");
+    }
+    return buffer.data();
+}
+
+std::wstring parentPath(const std::wstring& path) {
+    const std::size_t separator = path.find_last_of(L"\\/");
+    return separator == std::wstring::npos ? std::wstring{} : path.substr(0, separator);
+}
+
+bool equalPath(const std::wstring& left, const std::wstring& right) {
+    return _wcsicmp(left.c_str(), right.c_str()) == 0;
+}
+
+void validateReplaceCandidate(const ReplaceSnapshot& snapshot, bool target) {
+    if (architecture() != "x64") throw InspectionError("WINDOWS_ARCHITECTURE_UNSUPPORTED", ERROR_NOT_SUPPORTED, "preflight", "Replace is x64-only.");
+    if (snapshot.filesystem != "NTFS") throw InspectionError("UNSUPPORTED_FILESYSTEM", ERROR_NOT_SUPPORTED, "preflight", "Replace requires NTFS.");
+    if (snapshot.remote) throw InspectionError("REMOTE_FILESYSTEM_UNSUPPORTED", ERROR_NOT_SUPPORTED, "preflight", "Replace requires local storage.");
+    if (snapshot.driveType != "FIXED") throw InspectionError("WINDOWS_DRIVE_TYPE_UNSUPPORTED", ERROR_NOT_SUPPORTED, "preflight", "Replace requires a fixed drive.");
+    if (!snapshot.normalFile) throw InspectionError("NON_REGULAR_FILE", ERROR_INVALID_DATA, "preflight", "Replace requires regular files.");
+    if (snapshot.reparsePoint) throw InspectionError("REPARSE_POINT_UNSUPPORTED", ERROR_REPARSE_TAG_INVALID, "preflight", "Reparse points are unsupported.");
+    if (snapshot.linkCount != 1) throw InspectionError("HARD_LINK_TARGET", ERROR_NOT_SUPPORTED, "preflight", "Hard links are unsupported.");
+    for (const std::string& reason : snapshot.blockingReasons) {
+        const bool preservedTargetMetadata = target && (
+            reason == "READ_ONLY_TARGET" || reason == "WINDOWS_SPECIAL_ACL" || reason == "WINDOWS_ADS_UNSUPPORTED");
+        if (!preservedTargetMetadata) throw InspectionError(reason, ERROR_NOT_SUPPORTED, "preflight", "Unsupported metadata is present.");
+    }
+}
+
+void requireBackupAbsent(const std::wstring& path) {
+    SetLastError(ERROR_SUCCESS);
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) throw InspectionError("BACKUP_PATH_COLLISION", ERROR_ALREADY_EXISTS, "backup-preflight", "Backup already exists.");
+    const DWORD error = GetLastError();
+    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+        throw InspectionError("BACKUP_PATH_UNSAFE", error, "backup-preflight", "Backup state cannot be established.");
+    }
+}
+
+bool pathMissing(const std::wstring& path) {
+    SetLastError(ERROR_SUCCESS);
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return false;
+    const DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+
+bool removeBackupArtifact(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) return pathMissing(path);
+    const bool readonly = (attributes & FILE_ATTRIBUTE_READONLY) != 0;
+    if (readonly && !SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY)) return false;
+    if (DeleteFileW(path.c_str())) return true;
+    if (readonly) SetFileAttributesW(path.c_str(), attributes);
+    return false;
+}
+
+#if defined(WPB_NATIVE_TEST_HOOKS)
+void applyReplaceTestFault(const std::wstring& targetPath, const std::wstring& replacementPath) {
+    std::array<WCHAR, 64> value{};
+    const DWORD length = GetEnvironmentVariableW(L"WPB_TEST_WINDOWS_REPLACE_FAULT", value.data(), static_cast<DWORD>(value.size()));
+    if (length == 0 || length >= static_cast<DWORD>(value.size())) return;
+    const std::wstring fault(value.data(), length);
+    if (fault == L"final-hash-mismatch" || fault == L"rollback-failure") {
+        Handle target(CreateFileW(targetPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (target.value != INVALID_HANDLE_VALUE) {
+            const char byte = '!'; DWORD written = 0; WriteFile(target.value, &byte, 1, &written, nullptr); FlushFileBuffers(target.value);
+        }
+        if (fault == L"rollback-failure") CreateDirectoryW(replacementPath.c_str(), nullptr);
+    } else if (fault == L"final-metadata-mismatch") {
+        const DWORD attributes = GetFileAttributesW(targetPath.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES) SetFileAttributesW(targetPath.c_str(), attributes ^ FILE_ATTRIBUTE_HIDDEN);
+    }
+}
+#endif
+
+std::string replaceFiles(const JsonValue& request, const std::string& requestId) {
+    const JsonValue& targetEndpoint = required(request, "target", JsonValue::Type::Object);
+    const JsonValue& replacementEndpoint = required(request, "replacement", JsonValue::Type::Object);
+    const JsonValue& backupEndpoint = required(request, "backup", JsonValue::Type::Object);
+    const std::wstring targetPath = absoluteLocalPath(jsonString(targetEndpoint, "path"));
+    const std::wstring replacementPath = absoluteLocalPath(jsonString(replacementEndpoint, "path"));
+    const std::wstring backupPath = absoluteLocalPath(jsonString(backupEndpoint, "path"));
+    if (equalPath(targetPath, replacementPath) || equalPath(targetPath, backupPath) || equalPath(replacementPath, backupPath)) {
+        throw InspectionError("INVALID_PATH", ERROR_INVALID_NAME, "protocol", "Replace paths must be distinct.");
+    }
+    if (!equalPath(parentPath(targetPath), parentPath(replacementPath)) || !equalPath(parentPath(targetPath), parentPath(backupPath))) {
+        throw InspectionError("BACKUP_PATH_UNSAFE", ERROR_NOT_SAME_DEVICE, "backup-preflight", "All paths must share one directory.");
+    }
+    requireBackupAbsent(backupPath);
+
+    const ExpectedSnapshot expectedTarget = expectedSnapshot(targetEndpoint);
+    const ExpectedSnapshot expectedReplacement = expectedSnapshot(replacementEndpoint);
+    const ReplaceSnapshot original = replaceSnapshot(targetPath);
+    const ReplaceSnapshot replacement = replaceSnapshot(replacementPath);
+    validateReplaceCandidate(original, true);
+    validateReplaceCandidate(replacement, false);
+    if (original.identityVolume != replacement.identityVolume || original.volumeFingerprint != replacement.volumeFingerprint) {
+        throw InspectionError("VOLUME_MISMATCH", ERROR_NOT_SAME_DEVICE, "preflight", "Target and replacement must be on one volume.");
+    }
+    if (!matchesExpected(original, expectedTarget) || !matchesExpected(replacement, expectedReplacement)) {
+        throw InspectionError("STALE_FILE", ERROR_INVALID_DATA, "snapshot", "A replace endpoint changed after planning.");
+    }
+
+    const ReplaceSnapshot targetBeforeCall = replaceSnapshot(targetPath);
+    const ReplaceSnapshot replacementBeforeCall = replaceSnapshot(replacementPath);
+    requireBackupAbsent(backupPath);
+    if (!sameSnapshot(original, targetBeforeCall) || !sameSnapshot(replacement, replacementBeforeCall)) {
+        throw InspectionError("STALE_FILE", ERROR_INVALID_DATA, "pre-replace", "A replace endpoint changed before ReplaceFileW.");
+    }
+
+    if (!ReplaceFileW(targetPath.c_str(), replacementPath.c_str(), backupPath.c_str(), 0, nullptr, nullptr)) {
+        const DWORD replaceError = GetLastError();
+        bool originalStillPresent = false;
+        bool replacementStillPresent = false;
+        try { originalStillPresent = sameSnapshot(original, replaceSnapshot(targetPath)); } catch (...) {}
+        try { replacementStillPresent = sameSnapshot(replacement, replaceSnapshot(replacementPath)); } catch (...) {}
+        if (originalStillPresent && replacementStillPresent && pathMissing(backupPath)) {
+            throw InspectionError("WINDOWS_REPLACE_FAILED", replaceError, "replace-file", "ReplaceFileW failed without an observed state change.");
+        }
+        throw InspectionError("WINDOWS_RECOVERY_REQUIRED", replaceError, "replace-file-partial", "ReplaceFileW left an uncertain state.");
+    }
+
+#if defined(WPB_NATIVE_TEST_HOOKS)
+    applyReplaceTestFault(targetPath, replacementPath);
+#endif
+
+    bool finalValid = false;
+    bool backupValid = false;
+    try {
+        const ReplaceSnapshot finalTarget = replaceSnapshot(targetPath);
+        const ReplaceSnapshot backup = replaceSnapshot(backupPath);
+        backupValid = sameSnapshot(original, backup);
+        finalValid = finalTarget.contentSha256 == replacement.contentSha256 && finalTarget.size == replacement.size &&
+            sameIdentity(finalTarget, replacement) &&
+            finalTarget.preservedMetadataFingerprint == original.preservedMetadataFingerprint &&
+            pathMissing(replacementPath);
+    } catch (...) {
+        finalValid = false;
+    }
+
+    if (!finalValid) {
+        if (!backupValid) {
+            throw InspectionError("WINDOWS_RECOVERY_REQUIRED", ERROR_INVALID_DATA, "final-validation", "Final validation failed and backup is not verified.");
+        }
+        if (!ReplaceFileW(targetPath.c_str(), backupPath.c_str(), replacementPath.c_str(), 0, nullptr, nullptr)) {
+            throw InspectionError("WINDOWS_RECOVERY_REQUIRED", GetLastError(), "rollback", "Automatic rollback failed.");
+        }
+        bool restored = false;
+        try { restored = sameSnapshot(original, replaceSnapshot(targetPath)); } catch (...) {}
+        if (!restored) {
+            throw InspectionError("WINDOWS_RECOVERY_REQUIRED", ERROR_INVALID_DATA, "rollback-validation", "Rollback validation failed.");
+        }
+        const bool recoveryRemoved = removeBackupArtifact(replacementPath);
+        if (!recoveryRemoved) {
+            throw InspectionError("WINDOWS_REPLACE_ROLLED_BACK_ARTIFACT_RETAINED", ERROR_CANNOT_MAKE, "rollback-cleanup", "Rollback succeeded but a recovery artifact remains.");
+        }
+        throw InspectionError("WINDOWS_REPLACE_ROLLED_BACK", ERROR_INVALID_DATA, "final-validation", "Final validation failed and the original was restored.");
+    }
+
+    const bool backupRemoved = removeBackupArtifact(backupPath);
+    if (!backupRemoved) {
+        throw InspectionError("WINDOWS_RECOVERY_ARTIFACT_RETAINED", ERROR_CANNOT_MAKE, "cleanup", "Replace committed but backup cleanup failed.");
+    }
+    return "{\"schemaVersion\":2,\"helperVersion\":\"" + std::string(kHelperVersion) +
+        "\",\"requestId\":" + escapeJson(requestId) +
+        ",\"ok\":true,\"operation\":\"replace\",\"transaction\":{\"state\":\"COMMITTED\",\"replaceFileFlags\":0,\"backupRemoved\":true,\"rollback\":{\"attempted\":false,\"succeeded\":false,\"recoveryArtifactRetained\":false}}}";
+}
+
 } // namespace
 
 int main() {
@@ -741,7 +1046,12 @@ int main() {
             std::cout << errorResponse(schemaVersion, operation, requestId, "HELPER_SCHEMA_UNSUPPORTED", ERROR_REVISION_MISMATCH, "protocol");
             return 2;
         }
-        if (operation != "inspect") throw InspectionError("OPERATION_UNSUPPORTED", ERROR_INVALID_FUNCTION, "protocol", "Only inspect is supported.");
+        if (operation == "replace") {
+            if (schemaVersion != 2) throw InspectionError("OPERATION_UNSUPPORTED", ERROR_INVALID_FUNCTION, "protocol", "Replace requires protocol v2.");
+            std::cout << replaceFiles(request, requestId);
+            return 0;
+        }
+        if (operation != "inspect") throw InspectionError("OPERATION_UNSUPPORTED", ERROR_INVALID_FUNCTION, "protocol", "Operation is unsupported.");
         const JsonValue& target = required(request, "target", JsonValue::Type::Object);
         const std::string targetPathUtf8 = required(target, "path", JsonValue::Type::String).text;
         if (targetPathUtf8.empty()) throw InspectionError("INVALID_PATH", ERROR_INVALID_NAME, "protocol", "Target path is empty.");

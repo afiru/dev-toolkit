@@ -99,7 +99,7 @@ test('Windows native inspector accepts a valid protocol v1 response', () => {
     assert.equal(result.response.capabilities.completeForReplace, false);
 });
 
-test('protocol v1 and inspection-only v2 schemas remain distinct and valid JSON', () => {
+test('protocol v1 inspect remains stable and protocol v2 defines replace snapshots', () => {
     const testDirectory = path.dirname(fileURLToPath(import.meta.url));
     const protocolDirectory = path.resolve(testDirectory, '..', '..', 'native', 'windows-inspector');
     const v1 = JSON.parse(fs.readFileSync(path.join(protocolDirectory, 'protocol-schema-v1.json'), 'utf8'));
@@ -108,7 +108,14 @@ test('protocol v1 and inspection-only v2 schemas remain distinct and valid JSON'
     assert.equal(v2.oneOf[0].properties.schemaVersion.const, 2);
     assert.equal(v1.oneOf[0].properties.operation.const, 'inspect');
     assert.equal(v2.oneOf[0].properties.operation.const, 'inspect');
-    assert.doesNotMatch(JSON.stringify(v2), /ReplaceFileW|lpReplacedFileName/);
+    assert.equal(v2.oneOf[1].properties.operation.const, 'replace');
+    assert.deepEqual(v2.oneOf[1].required, [
+        'schemaVersion', 'operation', 'requestId', 'target', 'replacement', 'backup'
+    ]);
+    assert.deepEqual(v2.$defs.expectedSnapshot.required, [
+        'contentSha256', 'size', 'identity', 'metadataFingerprint'
+    ]);
+    assert.doesNotMatch(JSON.stringify(v2), /REPLACEFILE_IGNORE|lpExclude|lpReserved/);
 });
 
 test('Windows native inspector rejects schema mismatch', () => {

@@ -1,12 +1,42 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://wp-builder.local/windows-inspector/protocol-schema-v2.json",
-  "title": "wp-builder Windows native inspector protocol v2 (inspection only)",
-  "description": "Phase A protocol. Only inspect is supported; replace remains unavailable.",
-  "type": "object",
+  "$id": "https://wp-builder.local/schemas/windows-native-inspector-protocol-v2.json",
+  "title": "wp-builder Windows native helper protocol v2",
+  "$defs": {
+    "identity": {
+      "type": "object",
+      "required": ["volumeSerial", "fileId"],
+      "properties": {
+        "volumeSerial": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+        "fileId": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
+      },
+      "additionalProperties": false
+    },
+    "expectedSnapshot": {
+      "type": "object",
+      "required": ["contentSha256", "size", "identity", "metadataFingerprint"],
+      "properties": {
+        "contentSha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "size": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+        "identity": { "$ref": "#/$defs/identity" },
+        "metadataFingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      },
+      "additionalProperties": false
+    },
+    "replaceEndpoint": {
+      "type": "object",
+      "required": ["path", "expected"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "expected": { "$ref": "#/$defs/expectedSnapshot" }
+      },
+      "additionalProperties": false
+    }
+  },
   "oneOf": [
     {
       "title": "Inspect request",
+      "type": "object",
       "required": ["schemaVersion", "operation", "requestId", "target"],
       "properties": {
         "schemaVersion": { "const": 2 },
@@ -15,9 +45,26 @@
         "target": {
           "type": "object",
           "required": ["path"],
-          "properties": {
-            "path": { "type": "string", "minLength": 1 }
-          },
+          "properties": { "path": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "title": "Replace request",
+      "type": "object",
+      "required": ["schemaVersion", "operation", "requestId", "target", "replacement", "backup"],
+      "properties": {
+        "schemaVersion": { "const": 2 },
+        "operation": { "const": "replace" },
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "target": { "$ref": "#/$defs/replaceEndpoint" },
+        "replacement": { "$ref": "#/$defs/replaceEndpoint" },
+        "backup": {
+          "type": "object",
+          "required": ["path"],
+          "properties": { "path": { "type": "string", "minLength": 1 } },
           "additionalProperties": false
         }
       },
@@ -25,6 +72,7 @@
     },
     {
       "title": "Inspect response",
+      "type": "object",
       "required": ["schemaVersion", "helperVersion", "requestId", "ok", "operation"],
       "properties": {
         "schemaVersion": { "const": 2 },
@@ -32,8 +80,8 @@
         "requestId": { "type": "string" },
         "ok": { "const": true },
         "operation": { "const": "inspect" },
-        "adapter": { "const": "windows-native-inspector-v1" },
-        "architecture": { "enum": ["x64", "arm64", "unknown"] },
+        "adapter": { "type": "string" },
+        "architecture": { "const": "x64" },
         "filesystem": { "type": "object" },
         "file": { "type": "object" },
         "security": { "type": "object" },
@@ -43,13 +91,46 @@
         "capabilities": { "type": "object" },
         "compatibility": { "type": "object" },
         "metadataFingerprint": { "type": "string" },
-        "blockingReasons": { "type": "array" },
-        "error": { "type": "object" }
+        "blockingReasons": { "type": "array" }
       },
       "additionalProperties": false
     },
     {
-      "title": "Protocol error response",
+      "title": "Replace response",
+      "type": "object",
+      "required": ["schemaVersion", "helperVersion", "requestId", "ok", "operation", "transaction"],
+      "properties": {
+        "schemaVersion": { "const": 2 },
+        "helperVersion": { "type": "string" },
+        "requestId": { "type": "string" },
+        "ok": { "const": true },
+        "operation": { "const": "replace" },
+        "transaction": {
+          "type": "object",
+          "required": ["state", "replaceFileFlags", "backupRemoved", "rollback"],
+          "properties": {
+            "state": { "const": "COMMITTED" },
+            "replaceFileFlags": { "const": 0 },
+            "backupRemoved": { "type": "boolean" },
+            "rollback": {
+              "type": "object",
+              "required": ["attempted", "succeeded", "recoveryArtifactRetained"],
+              "properties": {
+                "attempted": { "type": "boolean" },
+                "succeeded": { "type": "boolean" },
+                "recoveryArtifactRetained": { "type": "boolean" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "title": "Error response",
+      "type": "object",
       "required": ["schemaVersion", "helperVersion", "requestId", "ok", "operation", "error"],
       "properties": {
         "schemaVersion": { "const": 2 },
