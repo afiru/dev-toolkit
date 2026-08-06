@@ -118,9 +118,47 @@ jobs:
           $helperVersionMatch = [regex]::Match($source, 'kHelperVersion\[\]\s*=\s*"([^"]+)"')
           if (-not $helperVersionMatch.Success) { throw 'helperVersion could not be read from the source.' }
           $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
-          $sdkVersion = (Get-ChildItem -LiteralPath $sdkRoot -Directory |
-            Sort-Object { [version]$_.Name } -Descending |
-            Select-Object -First 1).Name
+          $sdkCandidates = @(Get-ChildItem -LiteralPath $sdkRoot -Directory | ForEach-Object {
+            $parsedVersion = $null
+            if ($_.Name -match '^\d+\.\d+\.\d+\.\d+$' -and
+                [System.Version]::TryParse($_.Name, [ref]$parsedVersion)) {
+              [pscustomobject]@{ Name = $_.Name; Version = $parsedVersion }
+            }
+          })
+          if ($sdkCandidates.Count -eq 0) {
+            throw "No versioned Windows SDK Include directory was found under $sdkRoot."
+          }
+          $sdkVersionSource = 'latest-versioned-include-directory'
+          $sdkBuildSelectionVerified = $false
+          $environmentSdkVersion = ([string]$env:WindowsSDKVersion).Trim().TrimEnd('\')
+          if ($environmentSdkVersion) {
+            $parsedEnvironmentVersion = $null
+            if ($environmentSdkVersion -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
+                -not [System.Version]::TryParse($environmentSdkVersion, [ref]$parsedEnvironmentVersion)) {
+              throw "WindowsSDKVersion is not a supported four-part version: $environmentSdkVersion"
+            }
+            $selectedSdk = $sdkCandidates |
+              Where-Object { $_.Version -eq $parsedEnvironmentVersion } |
+              Select-Object -First 1
+            if (-not $selectedSdk) {
+              throw "WindowsSDKVersion does not match an installed Include directory: $environmentSdkVersion"
+            }
+            $sdkVersionSource = 'WindowsSDKVersion-environment-candidate'
+          } else {
+            $selectedSdk = $sdkCandidates |
+              Sort-Object Version -Descending |
+              Select-Object -First 1
+          }
+          $sdkVersion = $selectedSdk.Name
+          $sdkSummary = [ordered]@{
+            version = $sdkVersion
+            source = $sdkVersionSource
+            buildSelectionVerified = $sdkBuildSelectionVerified
+          }
+          $summaryPath = Join-Path $env:WPB_NATIVE_ARTIFACT_ROOT 'validation-summary.json'
+          $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+          $summary | Add-Member -NotePropertyName windowsSdk -NotePropertyValue $sdkSummary -Force
+          $summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $summaryPath -Encoding utf8
           $item = Get-Item -LiteralPath $env:WPB_NATIVE_HELPER_PATH
           $manifest = [ordered]@{
             manifestSchemaVersion = 1
@@ -143,6 +181,8 @@ jobs:
               platformToolset = 'v143'
               msvcVersion = $env:WPB_MSVC_VERSION
               windowsSdkVersion = $sdkVersion
+              windowsSdkVersionSource = $sdkVersionSource
+              windowsSdkBuildSelectionVerified = $sdkBuildSelectionVerified
               runtimeLibrary = 'MultiThreaded (/MT)'
             }
             securityFlags = @('/GS', '/guard:cf', '/DYNAMICBASE', '/HIGHENTROPYVA', '/NXCOMPAT')
