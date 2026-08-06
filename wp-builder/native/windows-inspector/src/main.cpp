@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -275,7 +276,7 @@ public:
     Sha256(const Sha256&) = delete;
     Sha256& operator=(const Sha256&) = delete;
     void update(const void* data, std::size_t length) {
-        if (length > MAXULONG) throw std::runtime_error("Hash input is too large.");
+        if (length > std::numeric_limits<ULONG>::max()) throw std::runtime_error("Hash input is too large.");
         if (BCryptHashData(hash_, const_cast<PUCHAR>(static_cast<const UCHAR*>(data)), static_cast<ULONG>(length), 0) < 0) {
             throw std::runtime_error("BCryptHashData failed.");
         }
