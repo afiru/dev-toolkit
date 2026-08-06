@@ -58,7 +58,7 @@
   <Target Name="WriteWpbWindowsSdkSelection" AfterTargets="PrepareForBuild" Condition="'$(WpbWindowsSdkSelectionFile)' != ''">
     <WriteLinesToFile
       File="$(WpbWindowsSdkSelectionFile)"
-      Lines="WindowsTargetPlatformVersion=$(WindowsTargetPlatformVersion)|WindowsSDKVersion=$(WindowsSDKVersion)"
+      Lines="WindowsTargetPlatformVersion=$(WindowsTargetPlatformVersion);WindowsSDKVersion=$(WindowsSDKVersion);UCRTVersion=$(UCRTVersion)"
       Overwrite="true"
       Encoding="UTF-8" />
   </Target>

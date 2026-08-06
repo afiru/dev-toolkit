@@ -122,26 +122,64 @@ jobs:
           $helperVersionMatch = [regex]::Match($source, 'kHelperVersion\[\]\s*=\s*"([^"]+)"')
           if (-not $helperVersionMatch.Success) { throw 'helperVersion could not be read from the source.' }
           $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
-          $sdkSelection = (Get-Content -LiteralPath $env:WPB_WINDOWS_SDK_SELECTION_FILE -Raw).Trim()
-          $sdkSelectionMatch = [regex]::Match(
-            $sdkSelection,
-            '^WindowsTargetPlatformVersion=([^|]+)\|WindowsSDKVersion=([^|]+)$'
-          )
-          if (-not $sdkSelectionMatch.Success) {
-            throw "MSBuild returned an invalid Windows SDK selection record."
+          $sdkSelectionLines = @(Get-Content -LiteralPath $env:WPB_WINDOWS_SDK_SELECTION_FILE |
+            ForEach-Object { $_.Trim().TrimStart([char]0xFEFF) } |
+            Where-Object { $_ -ne '' })
+          $sdkSelection = @{}
+          foreach ($line in $sdkSelectionLines) {
+            $match = [regex]::Match($line, '^(WindowsTargetPlatformVersion|WindowsSDKVersion|UCRTVersion)=(.*)$')
+            if (-not $match.Success) {
+              throw 'MSBuild returned a malformed Windows SDK selection record.'
+            }
+            $name = $match.Groups[1].Value
+            if ($sdkSelection.ContainsKey($name)) {
+              throw "MSBuild returned a duplicate Windows SDK selection property: $name"
+            }
+            $sdkSelection[$name] = $match.Groups[2].Value.Trim()
           }
-          $targetPlatformVersion = $sdkSelectionMatch.Groups[1].Value.Trim().TrimEnd('\')
-          $sdkVersion = $sdkSelectionMatch.Groups[2].Value.Trim().TrimEnd('\')
-          $parsedSdkVersion = $null
-          if ($sdkVersion -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
-              -not [System.Version]::TryParse($sdkVersion, [ref]$parsedSdkVersion)) {
-            throw "MSBuild reported an invalid WindowsTargetPlatformVersion: $sdkVersion"
+          Write-Host "SDK selection record lines: $($sdkSelectionLines.Count)"
+          foreach ($name in @('WindowsTargetPlatformVersion', 'WindowsSDKVersion', 'UCRTVersion')) {
+            $displayValue = if ($sdkSelection.ContainsKey($name) -and $sdkSelection[$name] -ne '') {
+              $sdkSelection[$name]
+            } else {
+              '<empty>'
+            }
+            Write-Host "${name}: $displayValue"
           }
+
+          function ConvertTo-WpbSdkVersion([string]$Name, [string]$Value, [bool]$Required) {
+            $normalized = $Value.Trim().TrimEnd('\', '/')
+            if ($normalized -eq '') {
+              if ($Required) { throw "MSBuild did not report $Name." }
+              return $null
+            }
+            $parsed = $null
+            if ($normalized -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
+                -not [System.Version]::TryParse($normalized, [ref]$parsed)) {
+              throw "MSBuild reported an invalid ${Name}: $normalized"
+            }
+            return $normalized
+          }
+
+          $targetPlatformVersion = ConvertTo-WpbSdkVersion `
+            'WindowsTargetPlatformVersion' `
+            ([string]$sdkSelection['WindowsTargetPlatformVersion']) `
+            $true
+          foreach ($relatedName in @('WindowsSDKVersion', 'UCRTVersion')) {
+            $relatedVersion = ConvertTo-WpbSdkVersion `
+              $relatedName `
+              ([string]$sdkSelection[$relatedName]) `
+              $false
+            if ($null -ne $relatedVersion -and $relatedVersion -ne $targetPlatformVersion) {
+              throw "MSBuild SDK selection disagrees: WindowsTargetPlatformVersion=$targetPlatformVersion, ${relatedName}=$relatedVersion"
+            }
+          }
+          $sdkVersion = $targetPlatformVersion
           $sdkInclude = Join-Path $sdkRoot $sdkVersion
           if (-not (Test-Path -LiteralPath $sdkInclude -PathType Container)) {
             throw "MSBuild-selected Windows SDK Include directory does not exist: $sdkVersion"
           }
-          $sdkVersionSource = 'msbuild-resolved-WindowsSDKVersion'
+          $sdkVersionSource = 'msbuild-resolved-WindowsTargetPlatformVersion'
           $sdkBuildSelectionVerified = $true
           $sdkSummary = [ordered]@{
             version = $sdkVersion
