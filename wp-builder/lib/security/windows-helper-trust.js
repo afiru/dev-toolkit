@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 
 export const WINDOWS_HELPER_MANIFEST_SCHEMA_VERSION = 1;
 export const WINDOWS_HELPER_NAME = 'wpb-windows-inspector';
-export const WINDOWS_HELPER_VERSION = '0.1.0';
+export const WINDOWS_HELPER_VERSION = '0.2.0';
 export const WINDOWS_HELPER_ADAPTER = 'windows-native-inspector-v1';
 export const WINDOWS_HELPER_PRODUCTION_ARCHITECTURE = 'x64';
 export const WINDOWS_HELPER_INSPECTION_PROTOCOL = 1;

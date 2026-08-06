@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 export const WINDOWS_INSPECTOR_SCHEMA_VERSION = 1;
-export const WINDOWS_INSPECTOR_HELPER_VERSION = '0.1.0';
+export const WINDOWS_INSPECTOR_HELPER_VERSION = '0.2.0';
 export const WINDOWS_INSPECTOR_MAX_OUTPUT = 1024 * 1024;
 export const WINDOWS_INSPECTOR_TIMEOUT_MS = 5000;
 

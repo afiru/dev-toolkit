@@ -554,19 +554,24 @@ std::string driveTypeName(UINT type) {
 }
 
 std::string errorResponse(int schemaVersion, const std::string& operation, const std::string& requestId,
-    const std::string& code, DWORD windowsError, const std::string& phase) {
-    return "{\"schemaVersion\":" + std::to_string(schemaVersion) + ",\"helperVersion\":\"" + std::string(kHelperVersion) +
+    const std::string& code, DWORD windowsError, const std::string& phase, const std::string& validationJson = {}) {
+    std::string response = "{\"schemaVersion\":" + std::to_string(schemaVersion) + ",\"helperVersion\":\"" + std::string(kHelperVersion) +
         "\",\"requestId\":" + escapeJson(requestId) + ",\"ok\":false,\"operation\":" + escapeJson(operation) +
         ",\"error\":{\"code\":" + escapeJson(code) +
-        ",\"windowsError\":" + std::to_string(windowsError) + ",\"phase\":" + escapeJson(phase) + ",\"retryable\":false}}";
+        ",\"windowsError\":" + std::to_string(windowsError) + ",\"phase\":" + escapeJson(phase) + ",\"retryable\":false}";
+    if (!validationJson.empty()) response += ",\"validation\":" + validationJson;
+    return response + "}";
 }
 
 struct InspectionError : std::runtime_error {
     std::string code;
     DWORD windowsError;
     std::string phase;
-    InspectionError(std::string errorCode, DWORD nativeError, std::string errorPhase, const std::string& message)
-        : std::runtime_error(message), code(std::move(errorCode)), windowsError(nativeError), phase(std::move(errorPhase)) {}
+    std::string validationJson;
+    InspectionError(std::string errorCode, DWORD nativeError, std::string errorPhase, const std::string& message,
+        std::string safeValidationJson = {})
+        : std::runtime_error(message), code(std::move(errorCode)), windowsError(nativeError), phase(std::move(errorPhase)),
+          validationJson(std::move(safeValidationJson)) {}
 };
 
 std::string inspect(const std::wstring& targetPath, const std::string& requestId, int schemaVersion) {
@@ -722,13 +727,22 @@ struct ReplaceSnapshot {
     std::string metadataFingerprint;
     std::string preservedMetadataFingerprint;
     std::string volumeFingerprint;
+    std::string volumeSerial;
     std::string filesystem;
     std::string driveType;
     std::string attributes;
+    std::string ownerFingerprint;
+    std::string groupFingerprint;
+    std::string daclFingerprint;
+    std::string adsDigest;
+    std::string adsInventoryDigest;
+    std::string compressionFormat;
     std::vector<std::string> blockingReasons;
     bool remote = false;
     bool normalFile = false;
     bool reparsePoint = false;
+    bool daclProtected = false;
+    bool encrypted = false;
     std::uint64_t linkCount = 0;
 };
 
@@ -777,12 +791,21 @@ ReplaceSnapshot replaceSnapshot(const std::wstring& path) {
     snapshot.fileId = jsonString(identity, "fileId");
     snapshot.metadataFingerprint = jsonString(root, "metadataFingerprint");
     snapshot.volumeFingerprint = jsonString(filesystem, "volumeFingerprint");
+    snapshot.volumeSerial = jsonString(filesystem, "volumeSerial");
     snapshot.filesystem = jsonString(filesystem, "type");
     snapshot.driveType = jsonString(filesystem, "driveType");
     snapshot.attributes = jsonString(file, "attributes");
     snapshot.remote = jsonBoolean(filesystem, "remote");
     snapshot.normalFile = jsonBoolean(file, "normalFile");
     snapshot.reparsePoint = jsonBoolean(file, "reparsePoint");
+    snapshot.ownerFingerprint = jsonString(security, "ownerFingerprint");
+    snapshot.groupFingerprint = jsonString(security, "groupFingerprint");
+    snapshot.daclFingerprint = jsonString(security, "daclFingerprint");
+    snapshot.daclProtected = jsonBoolean(security, "daclProtected");
+    snapshot.adsDigest = jsonString(streams, "digest");
+    snapshot.adsInventoryDigest = jsonString(streams, "inventoryDigest");
+    snapshot.compressionFormat = jsonString(compression, "format");
+    snapshot.encrypted = jsonBoolean(encryption, "encrypted");
     snapshot.linkCount = std::stoull(jsonString(file, "linkCount"));
     for (const JsonValue& reason : reasons.array) snapshot.blockingReasons.push_back(jsonString(reason, "code"));
 
@@ -792,14 +815,14 @@ ReplaceSnapshot replaceSnapshot(const std::wstring& path) {
         preserved += name + "=" + value;
     };
     add("attributes", snapshot.attributes);
-    add("dacl", jsonString(security, "daclFingerprint"));
-    add("daclProtected", jsonBoolean(security, "daclProtected") ? "true" : "false");
-    add("owner", jsonString(security, "ownerFingerprint"));
-    add("group", jsonString(security, "groupFingerprint"));
-    add("ads", jsonString(streams, "digest"));
-    add("adsInventory", jsonString(streams, "inventoryDigest"));
-    add("compression", jsonString(compression, "format"));
-    add("encrypted", jsonBoolean(encryption, "encrypted") ? "true" : "false");
+    add("dacl", snapshot.daclFingerprint);
+    add("daclProtected", snapshot.daclProtected ? "true" : "false");
+    add("owner", snapshot.ownerFingerprint);
+    add("group", snapshot.groupFingerprint);
+    add("ads", snapshot.adsDigest);
+    add("adsInventory", snapshot.adsInventoryDigest);
+    add("compression", snapshot.compressionFormat);
+    add("encrypted", snapshot.encrypted ? "true" : "false");
     snapshot.preservedMetadataFingerprint = digestTagged("wpb-windows-preserved-metadata-v1", preserved);
     return snapshot;
 }
@@ -840,6 +863,113 @@ bool sameIdentity(const ReplaceSnapshot& left, const ReplaceSnapshot& right) {
     return left.identityVolume == right.identityVolume && left.fileId == right.fileId;
 }
 
+std::string recomputeMetadataFingerprint(const ReplaceSnapshot& snapshot) {
+    std::string canonical = "schema=wpb-windows-metadata-v1";
+    const auto add = [&canonical](const std::string& name, const std::string& value) {
+        canonical.push_back('\0');
+        canonical += name + "=" + value;
+    };
+    add("filesystem", snapshot.filesystem);
+    add("remote", snapshot.remote ? "true" : "false");
+    add("drive", snapshot.driveType);
+    add("volume", snapshot.volumeSerial);
+    add("identityVolume", snapshot.identityVolume);
+    add("fileId", snapshot.fileId);
+    add("links", std::to_string(snapshot.linkCount));
+    add("size", snapshot.size);
+    add("attributes", snapshot.attributes);
+    add("dacl", snapshot.daclFingerprint);
+    add("owner", snapshot.ownerFingerprint);
+    add("group", snapshot.groupFingerprint);
+    add("ads", snapshot.adsDigest);
+    add("compression", std::to_string(std::stoul(snapshot.compressionFormat, nullptr, 16)));
+    return digestTagged("wpb-windows-metadata-v1", canonical);
+}
+
+ReplaceSnapshot expectedFinalSnapshot(const ReplaceSnapshot& original, const ReplaceSnapshot& replacement) {
+    ReplaceSnapshot expected = original;
+    expected.contentSha256 = replacement.contentSha256;
+    expected.size = replacement.size;
+    expected.identityVolume = replacement.identityVolume;
+    expected.fileId = replacement.fileId;
+    expected.linkCount = replacement.linkCount;
+    expected.metadataFingerprint = recomputeMetadataFingerprint(expected);
+    return expected;
+}
+
+struct ValidationDiagnostic {
+    std::string stage;
+    std::string subject;
+    bool contentHashMatches = false;
+    bool sizeMatches = false;
+    bool volumeMatches = false;
+    bool identityMatches = false;
+    bool ownerMatches = false;
+    bool groupMatches = false;
+    bool daclMatches = false;
+    bool protectedAclMatches = false;
+    bool adsMatches = false;
+    bool attributesMatch = false;
+    bool linkCountMatches = false;
+    bool regularFileMatches = false;
+    bool reparseStateMatches = false;
+    bool metadataFingerprintMatches = false;
+
+    bool allMatch() const {
+        return contentHashMatches && sizeMatches && volumeMatches && identityMatches && ownerMatches &&
+            groupMatches && daclMatches && protectedAclMatches && adsMatches && attributesMatch &&
+            linkCountMatches && regularFileMatches && reparseStateMatches && metadataFingerprintMatches;
+    }
+};
+
+ValidationDiagnostic compareSnapshots(const std::string& stage, const std::string& subject,
+    const ReplaceSnapshot& actual, const ReplaceSnapshot& expected) {
+    ValidationDiagnostic result;
+    result.stage = stage;
+    result.subject = subject;
+    result.contentHashMatches = actual.contentSha256 == expected.contentSha256;
+    result.sizeMatches = actual.size == expected.size;
+    result.volumeMatches = actual.volumeFingerprint == expected.volumeFingerprint && actual.identityVolume == expected.identityVolume;
+    result.identityMatches = sameIdentity(actual, expected);
+    result.ownerMatches = actual.ownerFingerprint == expected.ownerFingerprint;
+    result.groupMatches = actual.groupFingerprint == expected.groupFingerprint;
+    result.daclMatches = actual.daclFingerprint == expected.daclFingerprint;
+    result.protectedAclMatches = actual.daclProtected == expected.daclProtected;
+    result.adsMatches = actual.adsDigest == expected.adsDigest && actual.adsInventoryDigest == expected.adsInventoryDigest;
+    result.attributesMatch = actual.attributes == expected.attributes;
+    result.linkCountMatches = actual.linkCount == expected.linkCount;
+    result.regularFileMatches = actual.normalFile == expected.normalFile;
+    result.reparseStateMatches = actual.reparsePoint == expected.reparsePoint;
+    result.metadataFingerprintMatches = actual.metadataFingerprint == expected.metadataFingerprint;
+    return result;
+}
+
+std::string validationDiagnosticsJson(const std::vector<ValidationDiagnostic>& diagnostics) {
+    std::ostringstream output;
+    output << '[';
+    for (std::size_t index = 0; index < diagnostics.size(); ++index) {
+        if (index) output << ',';
+        const ValidationDiagnostic& item = diagnostics[index];
+        output << "{\"stage\":" << escapeJson(item.stage) << ",\"subject\":" << escapeJson(item.subject)
+            << ",\"contentHashMatches\":" << (item.contentHashMatches ? "true" : "false")
+            << ",\"sizeMatches\":" << (item.sizeMatches ? "true" : "false")
+            << ",\"volumeMatches\":" << (item.volumeMatches ? "true" : "false")
+            << ",\"identityMatches\":" << (item.identityMatches ? "true" : "false")
+            << ",\"ownerMatches\":" << (item.ownerMatches ? "true" : "false")
+            << ",\"groupMatches\":" << (item.groupMatches ? "true" : "false")
+            << ",\"daclMatches\":" << (item.daclMatches ? "true" : "false")
+            << ",\"protectedAclMatches\":" << (item.protectedAclMatches ? "true" : "false")
+            << ",\"adsMatches\":" << (item.adsMatches ? "true" : "false")
+            << ",\"attributesMatch\":" << (item.attributesMatch ? "true" : "false")
+            << ",\"linkCountMatches\":" << (item.linkCountMatches ? "true" : "false")
+            << ",\"regularFileMatches\":" << (item.regularFileMatches ? "true" : "false")
+            << ",\"reparseStateMatches\":" << (item.reparseStateMatches ? "true" : "false")
+            << ",\"metadataFingerprintMatches\":" << (item.metadataFingerprintMatches ? "true" : "false") << '}';
+    }
+    output << ']';
+    return output.str();
+}
+
 std::wstring absoluteLocalPath(const std::string& utf8Path) {
     if (utf8Path.empty()) throw InspectionError("INVALID_PATH", ERROR_INVALID_NAME, "protocol", "Path is empty.");
     const std::wstring path = utf8ToWide(utf8Path);
@@ -869,8 +999,8 @@ void validateReplaceCandidate(const ReplaceSnapshot& snapshot, bool target) {
     if (snapshot.filesystem != "NTFS") throw InspectionError("UNSUPPORTED_FILESYSTEM", ERROR_NOT_SUPPORTED, "preflight", "Replace requires NTFS.");
     if (snapshot.remote) throw InspectionError("REMOTE_FILESYSTEM_UNSUPPORTED", ERROR_NOT_SUPPORTED, "preflight", "Replace requires local storage.");
     if (snapshot.driveType != "FIXED") throw InspectionError("WINDOWS_DRIVE_TYPE_UNSUPPORTED", ERROR_NOT_SUPPORTED, "preflight", "Replace requires a fixed drive.");
-    if (!snapshot.normalFile) throw InspectionError("NON_REGULAR_FILE", ERROR_INVALID_DATA, "preflight", "Replace requires regular files.");
     if (snapshot.reparsePoint) throw InspectionError("REPARSE_POINT_UNSUPPORTED", ERROR_REPARSE_TAG_INVALID, "preflight", "Reparse points are unsupported.");
+    if (!snapshot.normalFile) throw InspectionError("NON_REGULAR_FILE", ERROR_INVALID_DATA, "preflight", "Replace requires regular files.");
     if (snapshot.linkCount != 1) throw InspectionError("HARD_LINK_TARGET", ERROR_NOT_SUPPORTED, "preflight", "Hard links are unsupported.");
     for (const std::string& reason : snapshot.blockingReasons) {
         const bool preservedTargetMetadata = target && (
@@ -979,35 +1109,48 @@ std::string replaceFiles(const JsonValue& request, const std::string& requestId)
 
     bool finalValid = false;
     bool backupValid = false;
+    ReplaceSnapshot finalTarget;
+    ReplaceSnapshot backup;
+    std::vector<ValidationDiagnostic> validationDiagnostics;
     try {
-        const ReplaceSnapshot finalTarget = replaceSnapshot(targetPath);
-        const ReplaceSnapshot backup = replaceSnapshot(backupPath);
-        backupValid = sameSnapshot(original, backup);
-        finalValid = finalTarget.contentSha256 == replacement.contentSha256 && finalTarget.size == replacement.size &&
-            sameIdentity(finalTarget, replacement) &&
-            finalTarget.preservedMetadataFingerprint == original.preservedMetadataFingerprint &&
-            pathMissing(replacementPath);
+        finalTarget = replaceSnapshot(targetPath);
+        backup = replaceSnapshot(backupPath);
+        const ReplaceSnapshot expectedFinal = expectedFinalSnapshot(original, replacement);
+        validationDiagnostics.push_back(compareSnapshots("post-replace", "target", finalTarget, expectedFinal));
+        validationDiagnostics.push_back(compareSnapshots("post-replace", "backup", backup, original));
+        finalValid = validationDiagnostics[0].allMatch() && pathMissing(replacementPath);
+        backupValid = validationDiagnostics[1].allMatch();
     } catch (...) {
         finalValid = false;
     }
 
     if (!finalValid) {
+        const std::string preRollbackDiagnostics = validationDiagnosticsJson(validationDiagnostics);
         if (!backupValid) {
-            throw InspectionError("WINDOWS_RECOVERY_REQUIRED", ERROR_INVALID_DATA, "final-validation", "Final validation failed and backup is not verified.");
+            throw InspectionError("WINDOWS_RECOVERY_REQUIRED", ERROR_INVALID_DATA, "final-validation",
+                "Final validation failed and backup is not verified.", preRollbackDiagnostics);
         }
         if (!ReplaceFileW(targetPath.c_str(), backupPath.c_str(), replacementPath.c_str(), 0, nullptr, nullptr)) {
-            throw InspectionError("WINDOWS_RECOVERY_REQUIRED", GetLastError(), "rollback", "Automatic rollback failed.");
+            throw InspectionError("WINDOWS_RECOVERY_REQUIRED", GetLastError(), "rollback", "Automatic rollback failed.", preRollbackDiagnostics);
         }
         bool restored = false;
-        try { restored = sameSnapshot(original, replaceSnapshot(targetPath)); } catch (...) {}
+        try {
+            const ReplaceSnapshot rollbackTarget = replaceSnapshot(targetPath);
+            validationDiagnostics.push_back(compareSnapshots("post-rollback", "target", rollbackTarget, original));
+            restored = validationDiagnostics.back().allMatch();
+        } catch (...) {}
+        const std::string postRollbackDiagnostics = validationDiagnosticsJson(validationDiagnostics);
         if (!restored) {
-            throw InspectionError("WINDOWS_RECOVERY_REQUIRED", ERROR_INVALID_DATA, "rollback-validation", "Rollback validation failed.");
+            throw InspectionError("WINDOWS_RECOVERY_REQUIRED", ERROR_INVALID_DATA, "rollback-validation",
+                "Rollback validation failed.", postRollbackDiagnostics);
         }
         const bool recoveryRemoved = removeBackupArtifact(replacementPath);
         if (!recoveryRemoved) {
-            throw InspectionError("WINDOWS_REPLACE_ROLLED_BACK_ARTIFACT_RETAINED", ERROR_CANNOT_MAKE, "rollback-cleanup", "Rollback succeeded but a recovery artifact remains.");
+            throw InspectionError("WINDOWS_REPLACE_ROLLED_BACK_ARTIFACT_RETAINED", ERROR_CANNOT_MAKE, "rollback-cleanup",
+                "Rollback succeeded but a recovery artifact remains.", postRollbackDiagnostics);
         }
-        throw InspectionError("WINDOWS_REPLACE_ROLLED_BACK", ERROR_INVALID_DATA, "final-validation", "Final validation failed and the original was restored.");
+        throw InspectionError("WINDOWS_REPLACE_ROLLED_BACK", ERROR_INVALID_DATA, "final-validation",
+            "Final validation failed and the original was restored.", postRollbackDiagnostics);
     }
 
     const bool backupRemoved = removeBackupArtifact(backupPath);
@@ -1016,7 +1159,8 @@ std::string replaceFiles(const JsonValue& request, const std::string& requestId)
     }
     return "{\"schemaVersion\":2,\"helperVersion\":\"" + std::string(kHelperVersion) +
         "\",\"requestId\":" + escapeJson(requestId) +
-        ",\"ok\":true,\"operation\":\"replace\",\"transaction\":{\"state\":\"COMMITTED\",\"replaceFileFlags\":0,\"backupRemoved\":true,\"rollback\":{\"attempted\":false,\"succeeded\":false,\"recoveryArtifactRetained\":false}}}";
+        ",\"ok\":true,\"operation\":\"replace\",\"transaction\":{\"state\":\"COMMITTED\",\"replaceFileFlags\":0,\"backupRemoved\":true,\"rollback\":{\"attempted\":false,\"succeeded\":false,\"recoveryArtifactRetained\":false}},\"validation\":" +
+        validationDiagnosticsJson(validationDiagnostics) + "}";
 }
 
 } // namespace
@@ -1062,7 +1206,7 @@ int main() {
         std::cout << inspect(targetPath, requestId, schemaVersion);
         return 0;
     } catch (const InspectionError& error) {
-        std::cout << errorResponse(schemaVersion, operation, requestId, error.code, error.windowsError, error.phase);
+        std::cout << errorResponse(schemaVersion, operation, requestId, error.code, error.windowsError, error.phase, error.validationJson);
         return 2;
     } catch (const std::exception&) {
         std::cout << errorResponse(schemaVersion, operation, requestId, "INSPECTION_FAILED", GetLastError(), "inspection");

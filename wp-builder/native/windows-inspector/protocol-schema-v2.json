@@ -31,6 +31,34 @@
         "expected": { "$ref": "#/$defs/expectedSnapshot" }
       },
       "additionalProperties": false
+    },
+    "validationDiagnostic": {
+      "type": "object",
+      "required": [
+        "stage", "subject", "contentHashMatches", "sizeMatches", "volumeMatches",
+        "identityMatches", "ownerMatches", "groupMatches", "daclMatches",
+        "protectedAclMatches", "adsMatches", "attributesMatch", "linkCountMatches",
+        "regularFileMatches", "reparseStateMatches", "metadataFingerprintMatches"
+      ],
+      "properties": {
+        "stage": { "enum": ["post-replace", "post-rollback"] },
+        "subject": { "enum": ["target", "backup"] },
+        "contentHashMatches": { "type": "boolean" },
+        "sizeMatches": { "type": "boolean" },
+        "volumeMatches": { "type": "boolean" },
+        "identityMatches": { "type": "boolean" },
+        "ownerMatches": { "type": "boolean" },
+        "groupMatches": { "type": "boolean" },
+        "daclMatches": { "type": "boolean" },
+        "protectedAclMatches": { "type": "boolean" },
+        "adsMatches": { "type": "boolean" },
+        "attributesMatch": { "type": "boolean" },
+        "linkCountMatches": { "type": "boolean" },
+        "regularFileMatches": { "type": "boolean" },
+        "reparseStateMatches": { "type": "boolean" },
+        "metadataFingerprintMatches": { "type": "boolean" }
+      },
+      "additionalProperties": false
     }
   },
   "oneOf": [
@@ -98,7 +126,7 @@
     {
       "title": "Replace response",
       "type": "object",
-      "required": ["schemaVersion", "helperVersion", "requestId", "ok", "operation", "transaction"],
+      "required": ["schemaVersion", "helperVersion", "requestId", "ok", "operation", "transaction", "validation"],
       "properties": {
         "schemaVersion": { "const": 2 },
         "helperVersion": { "type": "string" },
@@ -124,6 +152,10 @@
             }
           },
           "additionalProperties": false
+        },
+        "validation": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/validationDiagnostic" }
         }
       },
       "additionalProperties": false
@@ -148,6 +180,10 @@
             "retryable": { "type": "boolean" }
           },
           "additionalProperties": false
+        },
+        "validation": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/validationDiagnostic" }
         }
       },
       "additionalProperties": false

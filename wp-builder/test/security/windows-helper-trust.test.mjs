@@ -30,7 +30,7 @@ function fixture(t, overrides = {}) {
     const manifest = {
         manifestSchemaVersion: 1,
         helperName: 'wpb-windows-inspector',
-        helperVersion: '0.1.0',
+        helperVersion: '0.2.0',
         protocolSchemaVersions: [1, 2],
         adapter: 'windows-native-inspector-v1',
         platform: 'win32',

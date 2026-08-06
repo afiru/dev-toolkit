@@ -18,7 +18,7 @@ import {
 function responseFor(request, overrides = {}) {
     return {
         schemaVersion: 1,
-        helperVersion: '0.1.0',
+        helperVersion: '0.2.0',
         requestId: request.requestId,
         ok: true,
         operation: 'inspect',
@@ -115,6 +115,14 @@ test('protocol v1 inspect remains stable and protocol v2 defines replace snapsho
     assert.deepEqual(v2.$defs.expectedSnapshot.required, [
         'contentSha256', 'size', 'identity', 'metadataFingerprint'
     ]);
+    assert.deepEqual(v2.$defs.validationDiagnostic.required, [
+        'stage', 'subject', 'contentHashMatches', 'sizeMatches', 'volumeMatches',
+        'identityMatches', 'ownerMatches', 'groupMatches', 'daclMatches',
+        'protectedAclMatches', 'adsMatches', 'attributesMatch', 'linkCountMatches',
+        'regularFileMatches', 'reparseStateMatches', 'metadataFingerprintMatches'
+    ]);
+    assert.equal(v2.$defs.validationDiagnostic.additionalProperties, false);
+    assert.ok(v2.oneOf.find(entry => entry.title === 'Replace response').required.includes('validation'));
     assert.doesNotMatch(JSON.stringify(v2), /REPLACEFILE_IGNORE|lpExclude|lpReserved/);
 });
 
@@ -176,7 +184,7 @@ for (const code of ['ACCESS_DENIED', 'UNSUPPORTED_FILESYSTEM']) {
     test(`Windows native inspector preserves ${code} diagnostic`, () => {
         const result = runWithResponse(request => ({
             schemaVersion: 1,
-            helperVersion: '0.1.0',
+            helperVersion: '0.2.0',
             requestId: request.requestId,
             ok: false,
             operation: 'inspect',

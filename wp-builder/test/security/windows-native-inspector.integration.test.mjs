@@ -165,6 +165,38 @@ function runRawRequest(request, env = process.env) {
     return { status: result.status, response: JSON.parse(result.stdout.trim()) };
 }
 
+const validationBooleanFields = [
+    'contentHashMatches',
+    'sizeMatches',
+    'volumeMatches',
+    'identityMatches',
+    'ownerMatches',
+    'groupMatches',
+    'daclMatches',
+    'protectedAclMatches',
+    'adsMatches',
+    'attributesMatch',
+    'linkCountMatches',
+    'regularFileMatches',
+    'reparseStateMatches',
+    'metadataFingerprintMatches'
+];
+
+function reportSafeValidation(fixture, response) {
+    assert.ok(Array.isArray(response.validation), `${fixture}: validation diagnostics are missing`);
+    for (const item of response.validation) {
+        assert.deepEqual(Object.keys(item).sort(), ['stage', 'subject', ...validationBooleanFields].sort());
+        assert.match(item.stage, /^post-(?:replace|rollback)$/);
+        assert.match(item.subject, /^(?:target|backup)$/);
+        for (const field of validationBooleanFields) assert.equal(typeof item[field], 'boolean', `${fixture}: ${field}`);
+    }
+    const sanitized = JSON.stringify(response.validation);
+    assert.doesNotMatch(sanitized, /S-\d+(?:-\d+){1,}/);
+    assert.doesNotMatch(sanitized, /(?:^|[,\{\s])(?:O|G|D|S):(?:AI|AR|P|\()/);
+    assert.doesNotMatch(sanitized, /[A-Za-z]:\\/);
+    console.log(`WPB_VALIDATION ${fixture} ${sanitized}`);
+}
+
 function replaceEndpoint(file, response = inspect(file)) {
     return {
         path: path.resolve(file),
@@ -394,6 +426,7 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         const beforeTarget = inspect(fixture.target);
         const beforeReplacement = inspect(fixture.replacement);
         const result = runReplace(fixture);
+        reportSafeValidation('normal-replace', result.response);
         assert.equal(result.status, 0, JSON.stringify(result.response));
         assert.equal(result.response.transaction.state, 'COMMITTED');
         assert.equal(result.response.transaction.replaceFileFlags, 0);
@@ -413,6 +446,7 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         const before = inspect(fixture.target);
         assert.equal(before.security.daclProtected, false);
         const result = runReplace(fixture);
+        reportSafeValidation('inherited-acl', result.response);
         assert.equal(result.status, 0, JSON.stringify(result.response));
         const after = inspect(fixture.target);
         assert.equal(after.security.daclFingerprint, before.security.daclFingerprint);
@@ -441,6 +475,7 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         if (setup.status !== 0) return t.skip('The runner account cannot create an Administrators-owned fixture.');
         const before = inspect(fixture.target);
         const result = runReplace(fixture);
+        reportSafeValidation('administrators-owner', result.response);
         assert.equal(result.status, 0, JSON.stringify(result.response));
         assert.equal(inspect(fixture.target).security.ownerFingerprint, before.security.ownerFingerprint);
     });
@@ -450,6 +485,7 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         fs.writeFileSync(`${fixture.target}:wpb-phase-b`, 'sensitive-stream-value');
         const before = inspect(fixture.target);
         const result = runReplace(fixture);
+        reportSafeValidation('ads', result.response);
         assert.equal(result.status, 0, JSON.stringify(result.response));
         const after = inspect(fixture.target);
         assert.equal(after.streams.count, 1);
@@ -557,6 +593,7 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         const result = runReplace(fixture, {
             env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'final-hash-mismatch' }
         });
+        reportSafeValidation('rollback-after-hash-fault', result.response);
         assert.equal(result.status, 2);
         assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
         assert.deepEqual(fs.readFileSync(fixture.target), original);
@@ -571,6 +608,7 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         const result = runReplace(fixture, {
             env: { ...process.env, WPB_TEST_WINDOWS_REPLACE_FAULT: 'final-metadata-mismatch' }
         });
+        reportSafeValidation('rollback-after-metadata-fault', result.response);
         assert.equal(result.status, 2);
         assert.equal(result.response.error.code, 'WINDOWS_REPLACE_ROLLED_BACK');
         const after = inspect(fixture.target);
@@ -601,5 +639,6 @@ test('Windows native helper ReplaceFileW transaction fixtures', integrationOptio
         assert.equal(result.stdout.includes(root), false);
         assert.doesNotMatch(result.stdout, /S-\d+(?:-\d+){1,}/);
         assert.doesNotMatch(result.stdout, /(?:^|[,\{\s])(?:O|G|D|S):(?:AI|AR|P|\()/);
+        reportSafeValidation('raw-leak', JSON.parse(result.stdout));
     });
 });
