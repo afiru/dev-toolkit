@@ -152,6 +152,14 @@ program
     .requiredOption('--file <path>', 'One PHP file inside the current workspace')
     .option('--apply', 'Apply the previewed Security Fix Plan')
     .option('--yes', 'Skip interactive confirmation (requires --apply)')
+    .addHelpText('after', `
+Support:
+  Preview / Plan: supported on Windows, Linux, macOS, and other POSIX platforms.
+  Windows apply: unsupported (WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA).
+    Strict metadata preservation cannot be guaranteed.
+  Linux apply: KEEP_CANDIDATE; conditional and fail-closed for unsupported metadata.
+  Legacy "security --fix": DISABLE_CANDIDATE; migrate to "security:fix --file <path>".
+`)
     .action(async (options) => {
         if (options.yes && !options.apply) {
             console.error('[ERROR] --yes requires --apply.');
