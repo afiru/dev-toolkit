@@ -7,7 +7,11 @@ import {
     normalizePhpRuntimeContract,
     phpRuntimeBlockingReason
 } from '../../../lib/security/php-runtime-contract.js';
-import { assertExpectedPhpMinor, inspectPhpRuntime } from '../../helpers/php-runtime.mjs';
+import {
+    assertExpectedPhpMinor,
+    expectedPhpRuntimeGate,
+    inspectPhpRuntime
+} from '../../helpers/php-runtime.mjs';
 import { createTempWorkspace, writeTempFile } from '../../helpers/temp-workspace.mjs';
 
 function runtime(phpMajor, phpMinor, overrides = {}) {
@@ -40,6 +44,25 @@ test('PHP runtime version gate contract', async t => {
             const gate = classifyPhpRuntime(input);
             assert.equal(gate.status, status);
             assert.equal(gate.applyEligible, applyEligible);
+        });
+    }
+});
+
+test('test-side runtime expectation matrix is explicit and independent', async t => {
+    const cases = [
+        [runtime(7, 4), 'PHP_VERSION_UNSUPPORTED', false, 'PHP_VERSION_UNSUPPORTED'],
+        [runtime(8, 0), 'LEGACY_COMPATIBILITY', false, 'PHP_VERSION_LEGACY_COMPATIBILITY'],
+        [runtime(8, 1), 'LEGACY_COMPATIBILITY', false, 'PHP_VERSION_LEGACY_COMPATIBILITY'],
+        [runtime(8, 2), 'VERIFIED_APPLY_CANDIDATE', true, null],
+        [runtime(8, 3), 'VERIFIED_APPLY_CANDIDATE', true, null],
+        [runtime(8, 4), 'VERIFIED_APPLY_CANDIDATE', true, null],
+        [runtime(8, 5), 'PHP_VERSION_UNVERIFIED', false, 'PHP_VERSION_UNVERIFIED'],
+        [runtime(9, 0), 'PHP_VERSION_UNVERIFIED', false, 'PHP_VERSION_UNVERIFIED']
+    ];
+
+    for (const [input, status, applyEligible, blockingCode] of cases) {
+        await t.test(`${input.phpVersion} => ${status}`, () => {
+            assert.deepEqual(expectedPhpRuntimeGate(input), { status, applyEligible, blockingCode });
         });
     }
 });

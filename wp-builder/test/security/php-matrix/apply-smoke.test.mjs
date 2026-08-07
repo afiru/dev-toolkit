@@ -3,7 +3,11 @@ import fs from 'node:fs';
 import test from 'node:test';
 import { applySecurityFixPlan } from '../../../lib/security/fix-apply.js';
 import { buildSecurityFixPlan } from '../../../lib/security/fix-plan.js';
-import { assertExpectedPhpMinor, inspectPhpRuntime } from '../../helpers/php-runtime.mjs';
+import {
+    assertExpectedPhpMinor,
+    expectedPhpRuntimeGate,
+    inspectPhpRuntime
+} from '../../helpers/php-runtime.mjs';
 import {
     assertNoSecurityArtifacts,
     createTempWorkspace,
@@ -15,17 +19,20 @@ test('eligible PHP matrix runtime completes one apply smoke', {
 }, async t => {
     const runtime = inspectPhpRuntime();
     assertExpectedPhpMinor(assert, runtime);
+    const expectedRuntimeGate = expectedPhpRuntimeGate(runtime);
     const root = createTempWorkspace(t, 'php-matrix-apply');
     const file = writeTempFile(root, 'case.php', Buffer.from("<p><?= SCF::get('title') ?></p>\n"));
     const plan = buildSecurityFixPlan({ workspaceRoot: root, file });
 
-    if (runtime.phpMajor === 8 && runtime.phpMinor <= 1) {
+    assert.equal(plan.tokenizer.runtime.gate.status, expectedRuntimeGate.status);
+    if (!expectedRuntimeGate.applyEligible) {
         assert.equal(plan.canApply, false);
-        assert.ok(plan.blockingReasons.some(reason => reason.code === 'PHP_VERSION_LEGACY_COMPATIBILITY'));
+        assert.ok(plan.blockingReasons.some(reason => reason.code === expectedRuntimeGate.blockingCode));
+        assert.deepEqual(fs.readFileSync(file), plan.originalBytes);
+        assertNoSecurityArtifacts(root);
         return;
     }
 
-    assert.equal(plan.tokenizer.runtime.gate.status, 'VERIFIED_APPLY_CANDIDATE');
     assert.equal(plan.lint.passed, true, plan.lint.output);
     if (process.platform === 'win32') {
         assert.equal(plan.canApply, false);

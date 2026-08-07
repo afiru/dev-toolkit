@@ -254,11 +254,7 @@ jobs:
 
       - name: Run security test suites
         working-directory: wp-builder
-        shell: pwsh
-        run: |
-          npm test
-          npm run test:security:required
-          npm run test:security:metadata
+        run: npm run test:security:ci
 
       - name: Upload unsigned inspection-only helper
         if: ${{ always() && env.WPB_NATIVE_ARTIFACT_ROOT != '' }}

@@ -44,6 +44,35 @@ export function assertExpectedPhpMinor(assert, runtime = inspectPhpRuntime()) {
     );
 }
 
+export function expectedPhpRuntimeGate(runtime) {
+    if (runtime.phpMajor < 8) {
+        return {
+            status: 'PHP_VERSION_UNSUPPORTED',
+            applyEligible: false,
+            blockingCode: 'PHP_VERSION_UNSUPPORTED'
+        };
+    }
+    if (runtime.phpMajor === 8 && runtime.phpMinor <= 1) {
+        return {
+            status: 'LEGACY_COMPATIBILITY',
+            applyEligible: false,
+            blockingCode: 'PHP_VERSION_LEGACY_COMPATIBILITY'
+        };
+    }
+    if (runtime.phpMajor === 8 && runtime.phpMinor <= 4) {
+        return {
+            status: 'VERIFIED_APPLY_CANDIDATE',
+            applyEligible: true,
+            blockingCode: null
+        };
+    }
+    return {
+        status: 'PHP_VERSION_UNVERIFIED',
+        applyEligible: false,
+        blockingCode: 'PHP_VERSION_UNVERIFIED'
+    };
+}
+
 export function phpIntegrationTestOptions() {
     const runtime = inspectPhpRuntime();
     return runtime.available ? {} : { skip: runtime.reason };

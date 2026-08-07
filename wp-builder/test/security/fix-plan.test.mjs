@@ -3,7 +3,11 @@ import fs from 'node:fs';
 import test from 'node:test';
 import { buildSecurityFixPlan, sha256 } from '../../lib/security/fix-plan.js';
 import { renderSecurityFixPreview } from '../../lib/security/fix-preview.js';
-import { inspectPhpRuntime, securityFixIntegrationTestOptions } from '../helpers/php-runtime.mjs';
+import {
+    expectedPhpRuntimeGate,
+    inspectPhpRuntime,
+    securityFixIntegrationTestOptions
+} from '../helpers/php-runtime.mjs';
 import { createTempWorkspace, writeTempFile } from '../helpers/temp-workspace.mjs';
 
 test('Security Fix Plan contains immutable source and preview data without writing', securityFixIntegrationTestOptions(), t => {
@@ -43,12 +47,13 @@ test('Security Fix Plan contains immutable source and preview data without writi
     assert.match(plan.diff, /^\+\+\+ b\/case\.php/m);
     assert.equal(plan.lint.available, true);
     assert.equal(plan.lint.passed, true);
-    assert.equal(plan.canApply, !windowsApplyUnsupported);
     const phpRuntime = inspectPhpRuntime();
+    const expectedRuntimeGate = expectedPhpRuntimeGate(phpRuntime);
+    assert.equal(plan.canApply, !windowsApplyUnsupported && expectedRuntimeGate.applyEligible);
     assert.equal(plan.tokenizer.runtime.phpVersion, phpRuntime.phpVersion);
     assert.equal(plan.tokenizer.runtime.tokenizerAvailable, true);
     assert.equal(plan.tokenizer.runtime.helperSchemaVersion, 1);
-    assert.equal(plan.tokenizer.runtime.gate.status, 'VERIFIED_APPLY_CANDIDATE');
+    assert.equal(plan.tokenizer.runtime.gate.status, expectedRuntimeGate.status);
 
     const output = [];
     const errors = [];
@@ -60,7 +65,7 @@ test('Security Fix Plan contains immutable source and preview data without writi
     assert.ok(output.some(line => String(line).includes('AUTO_FIXABLE')));
     assert.ok(output.some(line => String(line).includes('unified diff:')));
     assert.ok(output.includes(`PHP runtime: ${phpRuntime.phpVersion}`));
-    assert.ok(output.includes('runtime status: VERIFIED_APPLY_CANDIDATE'));
+    assert.ok(output.includes(`runtime status: ${expectedRuntimeGate.status}`));
     if (plan.snapshot.metadata.windows?.daclSddl) {
         assert.ok(!output.join('\n').includes(plan.snapshot.metadata.windows.daclSddl));
     }
@@ -68,7 +73,11 @@ test('Security Fix Plan contains immutable source and preview data without writi
         assert.ok(errors.some(line => String(line).includes(
             '[WINDOWS_APPLY_UNSUPPORTED_STRICT_METADATA]'
         )));
-    } else {
+    }
+    if (expectedRuntimeGate.blockingCode) {
+        assert.ok(errors.some(line => String(line).includes(`[${expectedRuntimeGate.blockingCode}]`)));
+    }
+    if (!windowsApplyUnsupported && !expectedRuntimeGate.blockingCode) {
         assert.deepEqual(errors, []);
     }
     assert.deepEqual(fs.readFileSync(file), input);
