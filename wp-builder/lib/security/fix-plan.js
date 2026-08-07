@@ -127,9 +127,9 @@ function takeLinuxSecurityFileSnapshot(filePath, options) {
         const metadataOptions = {
             ...(options.metadata ?? {}),
             linuxFileDescriptor: fileDescriptor,
-            linuxFileSystemType: typeof fs.fstatfsSync === 'function'
-                ? fs.fstatfsSync(fileDescriptor).type
-                : null
+            linuxFileSystemType: typeof fs.statfsSync === 'function'
+            ? fs.statfsSync(`/proc/self/fd/${fileDescriptor}`).type
+            : null
         };
         const firstMetadata = inspectSecurityMetadata(filePath, afterConfirmRead, metadataOptions);
         const afterFirstInspection = fs.fstatSync(fileDescriptor);
