@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { applySecurityFixPlan } from '../../lib/security/fix-apply.js';
@@ -340,6 +341,25 @@ test('file identity change with identical bytes is stale', process.platform === 
         error => error.exitCode === 4 && error.code === 'STALE_FILE'
     );
     assert.deepEqual(fs.readFileSync(file), source);
+    assertNoSecurityArtifacts(root);
+});
+
+test('Linux symlink swap after Plan is stale and never changes either file', process.platform === 'linux'
+    ? securityFixIntegrationTestOptions()
+    : { skip: 'Linux-only symlink stale test.' }, async t => {
+    const root = createTempWorkspace(t, 'metadata-symlink-stale');
+    const file = writeTempFile(root, 'case.php', source);
+    const originalPath = path.join(root, 'original.php');
+    const plan = buildSecurityFixPlan({ workspaceRoot: root, file });
+    assert.equal(plan.canApply, true);
+    fs.renameSync(file, originalPath);
+    fs.symlinkSync(originalPath, file);
+    await assert.rejects(
+        () => applySecurityFixPlan(plan, { assumeYes: true }),
+        error => error.exitCode === 4 && error.code === 'STALE_FILE'
+    );
+    assert.deepEqual(fs.readFileSync(originalPath), source);
+    assert.equal(fs.lstatSync(file).isSymbolicLink(), true);
     assertNoSecurityArtifacts(root);
 });
 

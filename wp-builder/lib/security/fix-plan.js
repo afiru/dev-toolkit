@@ -43,7 +43,188 @@ export function resolveSecurityTarget(workspaceRoot, requestedPath) {
     return targetPath;
 }
 
+function linuxStatsMatch(left, right) {
+    return left.dev === right.dev &&
+        left.ino === right.ino &&
+        left.nlink === right.nlink &&
+        left.mode === right.mode &&
+        left.uid === right.uid &&
+        left.gid === right.gid &&
+        left.size === right.size &&
+        left.mtimeMs === right.mtimeMs &&
+        left.ctimeMs === right.ctimeMs;
+}
+
+function readLinuxDescriptor(fileDescriptor, size) {
+    const bytes = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+        const count = fs.readSync(fileDescriptor, bytes, offset, size - offset, offset);
+        if (count === 0) throw new Error('Linux target changed while its content was being read.');
+        offset += count;
+    }
+    return bytes;
+}
+
+function addLinuxInspectionBlock(metadata, code, message) {
+    return {
+        ...metadata,
+        posix: {
+            ...metadata.posix,
+            binding: {
+                ...metadata.posix?.binding,
+                identityVerified: false,
+                stablePasses: 2
+            }
+        },
+        capability: {
+            ...metadata.capability,
+            reproducible: false,
+            blockingReasons: [
+                ...(metadata.capability?.blockingReasons ?? []),
+                { code, message }
+            ]
+        }
+    };
+}
+
+function takeLinuxSecurityFileSnapshot(filePath, options) {
+    const flags = fs.constants.O_RDONLY |
+        (fs.constants.O_NOFOLLOW ?? 0) |
+        (fs.constants.O_NONBLOCK ?? 0);
+    let fileDescriptor;
+    try {
+        fileDescriptor = fs.openSync(filePath, flags);
+        const beforeRead = fs.fstatSync(fileDescriptor);
+        if (!beforeRead.isFile()) return {
+            state: 'unsafe',
+            normalFile: false,
+            symlink: false,
+            size: beforeRead.size,
+            hash: null,
+            bytes: null,
+            reason: 'Security target is not a normal file.'
+        };
+
+        const bytes = readLinuxDescriptor(fileDescriptor, beforeRead.size);
+        const afterRead = fs.fstatSync(fileDescriptor);
+        const confirmBytes = readLinuxDescriptor(fileDescriptor, afterRead.size);
+        const afterConfirmRead = fs.fstatSync(fileDescriptor);
+        if (!linuxStatsMatch(beforeRead, afterRead) ||
+            !linuxStatsMatch(afterRead, afterConfirmRead) ||
+            !bytes.equals(confirmBytes)) {
+            return {
+                state: 'unsafe',
+                normalFile: false,
+                symlink: false,
+                size: afterConfirmRead.size,
+                hash: null,
+                bytes: null,
+                reason: 'Linux target changed while its descriptor-bound snapshot was being read.'
+            };
+        }
+
+        const metadataOptions = {
+            ...(options.metadata ?? {}),
+            linuxFileDescriptor: fileDescriptor,
+            linuxFileSystemType: typeof fs.fstatfsSync === 'function'
+                ? fs.fstatfsSync(fileDescriptor).type
+                : null
+        };
+        const firstMetadata = inspectSecurityMetadata(filePath, afterConfirmRead, metadataOptions);
+        const afterFirstInspection = fs.fstatSync(fileDescriptor);
+        const secondMetadata = firstMetadata.capability?.inspectable
+            ? inspectSecurityMetadata(filePath, afterFirstInspection, metadataOptions)
+            : firstMetadata;
+        const afterSecondInspection = fs.fstatSync(fileDescriptor);
+        const finalPathStat = fs.lstatSync(filePath);
+        if (finalPathStat.isSymbolicLink() ||
+            !finalPathStat.isFile() ||
+            !linuxStatsMatch(afterConfirmRead, afterFirstInspection) ||
+            !linuxStatsMatch(afterFirstInspection, afterSecondInspection) ||
+            finalPathStat.dev !== afterSecondInspection.dev ||
+            finalPathStat.ino !== afterSecondInspection.ino ||
+            finalPathStat.nlink !== afterSecondInspection.nlink) {
+            return {
+                state: 'unsafe',
+                normalFile: false,
+                symlink: finalPathStat.isSymbolicLink(),
+                size: afterSecondInspection.size,
+                hash: null,
+                bytes: null,
+                reason: 'Linux target identity changed during descriptor-bound metadata inspection.'
+            };
+        }
+
+        const metadataStable = firstMetadata.securityFingerprint === secondMetadata.securityFingerprint &&
+            firstMetadata.posix?.inspectionFingerprint === secondMetadata.posix?.inspectionFingerprint;
+        const metadata = metadataStable
+            ? {
+                ...secondMetadata,
+                posix: {
+                    ...secondMetadata.posix,
+                    binding: {
+                        ...secondMetadata.posix?.binding,
+                        identityVerified: true,
+                        stablePasses: firstMetadata.capability?.inspectable ? 2 : 1
+                    }
+                }
+            }
+            : addLinuxInspectionBlock(
+                secondMetadata,
+                'POSIX_METADATA_CHANGED_DURING_INSPECTION',
+                'Linux ACL or xattr metadata changed during descriptor-bound inspection.'
+            );
+        return {
+            state: 'present',
+            normalFile: true,
+            symlink: false,
+            size: bytes.length,
+            hash: sha256(bytes),
+            bytes,
+            metadata,
+            reason: null
+        };
+    } catch (error) {
+        if (error.code === 'ENOENT') return {
+            state: 'missing',
+            normalFile: false,
+            symlink: false,
+            size: 0,
+            hash: null,
+            bytes: null,
+            reason: 'Security target does not exist.'
+        };
+        if (error.code === 'ELOOP') {
+            const stat = fs.lstatSync(filePath);
+            return {
+                state: 'unsafe',
+                normalFile: false,
+                symlink: true,
+                size: stat.size,
+                hash: null,
+                bytes: null,
+                reason: 'Symbolic links are not eligible for Security Fix apply.'
+            };
+        }
+        return {
+            state: 'unsafe',
+            normalFile: false,
+            symlink: false,
+            size: 0,
+            hash: null,
+            bytes: null,
+            reason: error.message
+        };
+    } finally {
+        if (fileDescriptor !== undefined) fs.closeSync(fileDescriptor);
+    }
+}
+
 export function takeSecurityFileSnapshot(filePath, options = {}) {
+    if ((options.metadata?.platform ?? process.platform) === 'linux') {
+        return takeLinuxSecurityFileSnapshot(filePath, options);
+    }
     try {
         const stat = fs.lstatSync(filePath);
         if (stat.isSymbolicLink()) return {

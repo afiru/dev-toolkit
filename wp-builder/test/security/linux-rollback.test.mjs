@@ -54,7 +54,8 @@ function finalFaultFileSystem(fixture, mutateFinal, options = {}) {
         desiredRenamed: false,
         rollingBack: false,
         backupCreated: false,
-        backupRemoved: false
+        backupRemoved: false,
+        directorySyncs: 0
     };
     const fileSystem = {
         ...fsPromises,
@@ -67,6 +68,17 @@ function finalFaultFileSystem(fixture, mutateFinal, options = {}) {
             const result = await fsPromises.unlink(target);
             if (target === fixture.rollbackPath) state.backupRemoved = true;
             return result;
+        },
+        open: async (target, flags, ...args) => {
+            const handle = await fsPromises.open(target, flags, ...args);
+            if (target !== fixture.root || flags !== 'r') return handle;
+            return {
+                sync: async () => {
+                    state.directorySyncs += 1;
+                    return handle.sync();
+                },
+                close: () => handle.close()
+            };
         },
         rename: async (oldPath, newPath) => {
             if (oldPath === fixture.rollbackPath) {
@@ -103,6 +115,7 @@ test('Linux rollback successful apply creates and removes its hard-link backup',
     assert.equal(result.status, 'applied');
     assert.equal(fault.state.backupCreated, true);
     assert.equal(fault.state.backupRemoved, true);
+    assert.ok(fault.state.directorySyncs >= 3, `expected backup, replace, and cleanup fsyncs; received ${fault.state.directorySyncs}`);
     assert.deepEqual(fs.readFileSync(fixture.file), fixture.plan.desiredBytes);
     assert.equal(fs.existsSync(fixture.rollbackPath), false);
     assertNoSecurityArtifacts(fixture.root);
@@ -146,6 +159,7 @@ test('Linux final-validation failures restore original inode and metadata', linu
                 'FINAL_VALIDATION_FAILED_ROLLED_BACK'
             );
             assert.equal(fault.state.backupCreated, true);
+            assert.ok(fault.state.directorySyncs >= 3, `expected backup, replace, and rollback fsyncs; received ${fault.state.directorySyncs}`);
             assertOriginalRestored(fixture);
         });
     }

@@ -1,7 +1,11 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
-export const LINUX_METADATA_ADAPTER = 'linux-tools-v1';
+export const LINUX_METADATA_ADAPTER = 'linux-procfd-tools-v1';
+const CHILD_INSPECTION_FD = 3;
+const CHILD_INSPECTION_PATH = `/proc/self/fd/${CHILD_INSPECTION_FD}`;
+const EXT4_SUPER_MAGIC = 0xef53;
 
 function digest(value) {
     return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -11,10 +15,11 @@ function reason(code, message) {
     return { code, message };
 }
 
-function runInspector(command, args, filePath, spawn) {
-    const result = spawn(command, [...args, '--', filePath], {
+function runInspector(command, args, fileDescriptor, spawn) {
+    const result = spawn(command, [...args, '--', CHILD_INSPECTION_PATH], {
         encoding: 'utf8',
         windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe', fileDescriptor],
         env: {
             ...process.env,
             LC_ALL: 'C',
@@ -127,6 +132,8 @@ function unavailableResult(detail) {
         readonly: null,
         posix: {
             adapter: LINUX_METADATA_ADAPTER,
+            binding: { method: 'proc-self-fd', inspected: false },
+            filesystem: { inspected: false, name: null, typeMagic: null, supported: false },
             acl: { inspected: false, present: null, entryCount: null, digest: null },
             xattrs: { inspected: false, present: null, count: null, digest: null },
             securityMetadata: { present: null },
@@ -147,6 +154,8 @@ function failedResult(detail) {
         readonly: null,
         posix: {
             adapter: LINUX_METADATA_ADAPTER,
+            binding: { method: 'proc-self-fd', inspected: false },
+            filesystem: { inspected: false, name: null, typeMagic: null, supported: false },
             acl: { inspected: false, present: null, entryCount: null, digest: null },
             xattrs: { inspected: false, present: null, count: null, digest: null },
             securityMetadata: { present: null },
@@ -164,11 +173,17 @@ function failedResult(detail) {
 
 export function inspectLinuxMetadata(filePath, stat, options = {}) {
     const spawn = options.spawnSync ?? spawnSync;
+    const fileDescriptor = options.linuxFileDescriptor;
+    const procFdAvailable = options.procFdAvailable ?? fs.existsSync('/proc/self/fd');
+    const fileSystemType = options.linuxFileSystemType;
+    if (!Number.isInteger(fileDescriptor) || fileDescriptor < 0 || !procFdAvailable || !Number.isInteger(fileSystemType)) {
+        return unavailableResult('Descriptor-bound Linux metadata inspection is unavailable.');
+    }
     const aclResult = runInspector('getfacl', [
         '--numeric',
         '--omit-header',
         '--absolute-names'
-    ], filePath, spawn);
+    ], fileDescriptor, spawn);
     if (!aclResult.ok) return aclResult.unavailable
         ? unavailableResult(aclResult.detail)
         : failedResult(aclResult.detail);
@@ -178,7 +193,7 @@ export function inspectLinuxMetadata(filePath, stat, options = {}) {
         '--match=-',
         '--encoding=hex',
         '--absolute-names'
-    ], filePath, spawn);
+    ], fileDescriptor, spawn);
     if (!xattrResult.ok) return xattrResult.unavailable
         ? unavailableResult(xattrResult.detail)
         : failedResult(xattrResult.detail);
@@ -194,6 +209,16 @@ export function inspectLinuxMetadata(filePath, stat, options = {}) {
 
     const readonly = (stat.mode & 0o222) === 0;
     const reasons = [];
+    const filesystem = {
+        inspected: true,
+        name: fileSystemType === EXT4_SUPER_MAGIC ? 'ext4' : 'unsupported',
+        typeMagic: `0x${fileSystemType.toString(16)}`,
+        supported: fileSystemType === EXT4_SUPER_MAGIC
+    };
+    if (!filesystem.supported) reasons.push(reason(
+        'POSIX_FILESYSTEM_UNSUPPORTED',
+        'Linux Security Fix apply is currently limited to descriptor-verified ext4 files.'
+    ));
     if (readonly) reasons.push(reason('READ_ONLY_TARGET', 'Read-only files are not eligible for Security Fix apply.'));
     if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) reasons.push(reason(
         'POSIX_OWNER_UNSUPPORTED',
@@ -222,6 +247,8 @@ export function inspectLinuxMetadata(filePath, stat, options = {}) {
 
     const posix = {
         adapter: LINUX_METADATA_ADAPTER,
+        binding: { method: 'proc-self-fd', inspected: true },
+        filesystem,
         acl,
         xattrs: {
             inspected: xattrs.inspected,
@@ -236,6 +263,8 @@ export function inspectLinuxMetadata(filePath, stat, options = {}) {
         aclDigest: acl.digest,
         xattrDigest: xattrs.digest,
         securityMetadataPresent: posix.securityMetadata.present,
+        filesystemType: filesystem.typeMagic,
+        filesystemSupported: filesystem.supported,
         inspected: acl.inspected && xattrs.inspected
     });
     const securityState = {
@@ -266,6 +295,8 @@ export function unsupportedPosixMetadata(platform) {
         readonly: null,
         posix: {
             adapter: `${platform}-unsupported`,
+            binding: { method: null, inspected: false },
+            filesystem: { inspected: false, name: null, typeMagic: null, supported: false },
             acl: { inspected: false, present: null, entryCount: null, digest: null },
             xattrs: { inspected: false, present: null, count: null, digest: null },
             securityMetadata: { present: null },

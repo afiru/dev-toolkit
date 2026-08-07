@@ -35,7 +35,10 @@ function inspect(config = {}) {
     const fake = createSpawn(config);
     const metadata = inspectSecurityMetadata(pathWithOptionPrefix, stat, {
         platform: 'linux',
-        spawnSync: fake.spawnSync
+        spawnSync: fake.spawnSync,
+        linuxFileDescriptor: 42,
+        linuxFileSystemType: 0xef53,
+        procFdAvailable: true
     });
     return { metadata, calls: fake.calls };
 }
@@ -49,14 +52,22 @@ test('Linux metadata inspector uses safe arguments and allows only empty ACL/xat
     assert.equal(metadata.capability.inspectable, true);
     assert.equal(metadata.capability.reproducible, true);
     assert.deepEqual(metadata.capability.blockingReasons, []);
-    assert.equal(metadata.posix.adapter, 'linux-tools-v1');
+    assert.equal(metadata.posix.adapter, 'linux-procfd-tools-v1');
+    assert.deepEqual(metadata.posix.binding, { method: 'proc-self-fd', inspected: true });
+    assert.deepEqual(metadata.posix.filesystem, {
+        inspected: true,
+        name: 'ext4',
+        typeMagic: '0xef53',
+        supported: true
+    });
     assert.equal(metadata.posix.acl.present, false);
     assert.equal(metadata.posix.acl.entryCount, 3);
     assert.equal(metadata.posix.xattrs.present, false);
     assert.equal(metadata.posix.xattrs.count, 0);
     assert.deepEqual(calls.map(call => call.command), ['getfacl', 'getfattr']);
     for (const call of calls) {
-        assert.deepEqual(call.args.slice(-2), ['--', pathWithOptionPrefix]);
+        assert.deepEqual(call.args.slice(-2), ['--', '/proc/self/fd/3']);
+        assert.equal(call.options.stdio[3], 42);
         assert.equal(call.options.env.LC_ALL, 'C');
         assert.equal(call.options.env.LANG, 'C');
         assert.equal(call.options.timeout, 5000);
@@ -67,6 +78,32 @@ test('Linux metadata inspector uses safe arguments and allows only empty ACL/xat
     assert.ok(calls[0].args.includes('--absolute-names'));
     assert.ok(calls[1].args.includes('--match=-'));
     assert.ok(calls[1].args.includes('--encoding=hex'));
+});
+
+test('Linux metadata inspector blocks unverified filesystems', () => {
+    const fake = createSpawn();
+    const metadata = inspectSecurityMetadata(pathWithOptionPrefix, stat, {
+        platform: 'linux',
+        spawnSync: fake.spawnSync,
+        linuxFileDescriptor: 42,
+        linuxFileSystemType: 0x794c7630,
+        procFdAvailable: true
+    });
+    assert.ok(codes(metadata).includes('POSIX_FILESYSTEM_UNSUPPORTED'));
+    assert.equal(metadata.posix.filesystem.name, 'unsupported');
+    assert.equal(metadata.capability.reproducible, false);
+});
+
+test('Linux metadata inspector refuses path-only inspection', () => {
+    const fake = createSpawn();
+    const metadata = inspectSecurityMetadata(pathWithOptionPrefix, stat, {
+        platform: 'linux',
+        spawnSync: fake.spawnSync,
+        procFdAvailable: true
+    });
+    assert.ok(codes(metadata).includes('POSIX_METADATA_INSPECTOR_UNAVAILABLE'));
+    assert.equal(metadata.capability.inspectable, false);
+    assert.deepEqual(fake.calls, []);
 });
 
 test('Linux additional ACL is blocking and raw ACL is not retained', () => {

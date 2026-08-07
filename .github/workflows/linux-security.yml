@@ -1,0 +1,118 @@
+name: Linux Security Fix
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-security.yml"
+      - "wp-builder/bin/**"
+      - "wp-builder/lib/security/**"
+      - "wp-builder/test/helpers/**"
+      - "wp-builder/test/security/**"
+      - "wp-builder/package.json"
+      - "wp-builder/package-lock.json"
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    name: PHP ${{ matrix.php }} / Linux security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.2", "8.3", "8.4"]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: wp-builder/package-lock.json
+
+      - name: Set up PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f # 2.37.0
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: tokenizer
+          coverage: none
+          tools: none
+        env:
+          fail-fast: true
+
+      - name: Install Linux metadata inspection tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends acl attr
+          getfacl --version
+          getfattr --version
+
+      - name: Record runtime and filesystem evidence
+        id: evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_php="$(php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;')"
+          if [[ "$actual_php" != "${{ matrix.php }}" ]]; then
+            echo "Expected PHP ${{ matrix.php }}, received $actual_php." >&2
+            exit 1
+          fi
+          php -r 'if (!extension_loaded("tokenizer")) { fwrite(STDERR, "tokenizer unavailable\n"); exit(2); } echo "tokenizer=true\n";'
+          fs_type="$(findmnt -T "${RUNNER_TEMP}" -n -o FSTYPE)"
+          fs_target="$(findmnt -T "${RUNNER_TEMP}" -n -o TARGET)"
+          if [[ -z "$fs_type" || -z "$fs_target" ]]; then
+            echo "Could not identify the runner temp filesystem." >&2
+            exit 1
+          fi
+          {
+            echo "### Linux security evidence — PHP ${{ matrix.php }}"
+            echo "- Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            echo "- Kernel: $(uname -srmo)"
+            echo "- Node: $(node --version)"
+            echo "- PHP: $(php -r 'echo PHP_VERSION;')"
+            echo "- PHP_VERSION_ID: $(php -r 'echo PHP_VERSION_ID;')"
+            echo "- tokenizer: enabled"
+            echo "- RUNNER_TEMP filesystem: ${fs_type} (mount ${fs_target})"
+            echo "- getfacl: $(getfacl --version 2>&1 | head -n 1)"
+            echo "- getfattr: $(getfattr --version 2>&1 | head -n 1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Node.js dependencies
+        working-directory: wp-builder
+        run: npm ci
+
+      - name: Check JavaScript syntax
+        working-directory: wp-builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          find bin lib test -type f \( -name '*.js' -o -name '*.mjs' \) -print0 | xargs -0 -n1 node --check
+
+      - name: Run PHP runtime matrix contract
+        working-directory: wp-builder
+        env:
+          WPB_EXPECTED_PHP_MINOR: ${{ matrix.php }}
+        run: npm run test:security:php-current
+
+      - name: Run real Linux metadata, apply, and rollback gates
+        if: matrix.php == '8.4'
+        working-directory: wp-builder
+        env:
+          WPB_EXPECTED_PHP_MINOR: ${{ matrix.php }}
+        run: npm run test:security:ci
+
+      - name: Verify repository remains unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff --exit-code
+          test -z "$(git status --porcelain)"

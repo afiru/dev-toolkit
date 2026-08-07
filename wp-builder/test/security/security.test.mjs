@@ -1,5 +1,6 @@
 await import('./analyzer.test.mjs');
 await import('./linux-metadata.test.mjs');
+await import('./linux-descriptor-snapshot.test.mjs');
 await import('./html-context.test.mjs');
 await import('./byte-preservation.test.mjs');
 await import('./fix-plan.test.mjs');
