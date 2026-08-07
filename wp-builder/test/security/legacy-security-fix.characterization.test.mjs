@@ -26,6 +26,10 @@ test('legacy security --fix characterization: unsafe comment and qualified-class
     const qualified = writeTempFile(root, 'qualified.php', "<p><?= Vendor\\SCF::get('title') ?></p>\n");
     const result = runCli(root, ['security', '--fix']);
     assert.equal(result.status, 0);
+    assert.match(
+        result.stderr,
+        /\[DEPRECATED\] Legacy "security --fix" is a DISABLE_CANDIDATE\. Use "security:fix --file <path>" instead\./
+    );
     assert.match(fs.readFileSync(comment, 'utf8'), /\/\/ esc_html\(SCF::get/);
     assert.match(fs.readFileSync(qualified, 'utf8'), /Vendor\\esc_html\(SCF::get/);
 });

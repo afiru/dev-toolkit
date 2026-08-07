@@ -37,6 +37,12 @@ function isAssignmentLine(line) {
 export function runSecurityScan(options = {
     fix: false
 }) {
+    if (options.fix) {
+        console.warn(
+            '[DEPRECATED] Legacy "security --fix" is a DISABLE_CANDIDATE. Use "security:fix --file <path>" instead.'
+        );
+    }
+
     const files = walkFiles(root, new Set(['.php']));
     console.log(`[DEBUG] Found ${files.length} PHP files to scan.`);
 
