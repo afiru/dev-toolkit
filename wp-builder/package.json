@@ -6,7 +6,7 @@
     "wp-builder": "./bin/cli.mjs"
   },
   "scripts": {
-    "test": "node --test test/security/security.test.mjs test/security/legacy-security-fix.characterization.test.mjs",
+    "test": "node --test test/security/security.test.mjs test/security/legacy-security-fix.characterization.test.mjs test/figma/sync-plan.test.mjs",
     "test:security": "node --test test/security/security.test.mjs test/security/legacy-security-fix.characterization.test.mjs",
     "test:security:required": "node --test test/security/security-required.test.mjs",
     "test:security:metadata": "node --test test/security/metadata.test.mjs test/security/linux-metadata.test.mjs test/security/linux-descriptor-snapshot.test.mjs test/security/linux-rollback.test.mjs",

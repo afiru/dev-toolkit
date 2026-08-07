@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { TextDecoder } from 'node:util';
 import {
     parseNodeToScss
 } from './generator.js';
@@ -8,6 +9,7 @@ import {
 export const FIGMA_GENERATOR_SCHEMA = 1;
 export const FIGMA_MAGIC_HEADER = '/* wp-builder:figma-generated';
 export const FIGMA_REQUIRED_FORWARD = '@forward "figma-generated";';
+export const FIGMA_REQUIRED_USE = '@use "Component/figma-generated";';
 
 const packageJson = JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
 const FIGMA_GENERATOR_VERSION = packageJson.version;
@@ -91,10 +93,24 @@ function normalizeDeclaration(value) {
 function comparableOwnedDeclaration(selector, declaration) {
     const selectorMatch = selector.match(/^\.(cl|bg)_([0-9a-fA-F]{6})$/);
     if (!selectorMatch) return normalizeDeclaration(declaration);
-    const declarationMatch = declaration.match(/^\s*(color|background-color)\s*:\s*#([0-9a-fA-F]{6})\s*;?\s*$/);
+    const declarationMatch = declaration.match(
+        /^\s*(color|background-color|background)\s*:\s*#([0-9a-fA-F]{6})\s*;?\s*$/
+    );
     if (!declarationMatch) return null;
+
+    const property = declarationMatch[1];
     const expectedProperty = selectorMatch[1] === 'cl' ? 'color' : 'background-color';
-    if (declarationMatch[1] !== expectedProperty) return null;
+
+    if (selectorMatch[1] === 'cl' && property !== 'color') return null;
+
+    if (
+        selectorMatch[1] === 'bg' &&
+        property !== 'background-color' &&
+        property !== 'background'
+    ) {
+        return null;
+    }
+
     return `${expectedProperty}: #${declarationMatch[2].toUpperCase()};`;
 }
 
@@ -199,10 +215,199 @@ function resolveScssModuleTarget(currentFile, specifier) {
     return path.resolve(path.dirname(currentFile), ...targetPosix.split('/'));
 }
 
+function scanTopLevelUseSpecifiers(source) {
+    const specifiers = [];
+    let braceDepth = 0;
+    let index = 0;
+
+    const unsafe = reason => ({ unsafe: true, reason, specifiers: [] });
+    const skipComment = start => {
+        if (source.startsWith('//', start)) {
+            const newline = source.indexOf('\n', start + 2);
+            return { unsafe: false, index: newline === -1 ? source.length : newline + 1 };
+        }
+        const end = source.indexOf('*/', start + 2);
+        return end === -1 ? unsafe('unterminated block comment') : { unsafe: false, index: end + 2 };
+    };
+    const skipQuoted = (start, rejectEscape = false) => {
+        const quote = source[start];
+        let value = '';
+        for (let cursor = start + 1; cursor < source.length; cursor += 1) {
+            const current = source[cursor];
+            if (current === '\\') {
+                if (cursor + 1 >= source.length) return unsafe('unterminated escape sequence in a quoted string');
+                if (rejectEscape) return unsafe('escaped module URLs cannot be compared safely');
+                cursor += 1;
+                continue;
+            }
+            if (current === quote) return { unsafe: false, index: cursor + 1, value };
+            if (current === '\r' || current === '\n') return unsafe('unterminated quoted string');
+            value += current;
+        }
+        return unsafe('unterminated quoted string');
+    };
+
+    while (index < source.length) {
+        if (source.startsWith('//', index) || source.startsWith('/*', index)) {
+            const comment = skipComment(index);
+            if (comment.unsafe) return comment;
+            index = comment.index;
+            continue;
+        }
+        if (source[index] === '"' || source[index] === "'") {
+            const quoted = skipQuoted(index);
+            if (quoted.unsafe) return quoted;
+            index = quoted.index;
+            continue;
+        }
+        if (source[index] === '{') {
+            braceDepth += 1;
+            index += 1;
+            continue;
+        }
+        if (source[index] === '}') {
+            braceDepth -= 1;
+            if (braceDepth < 0) return unsafe('unmatched closing brace');
+            index += 1;
+            continue;
+        }
+
+        const isUse = braceDepth === 0 &&
+            source.startsWith('@use', index) &&
+            !/[A-Za-z0-9_-]/.test(source[index - 1] ?? '') &&
+            !/[A-Za-z0-9_-]/.test(source[index + 4] ?? '');
+        if (!isUse) {
+            index += 1;
+            continue;
+        }
+
+        let cursor = index + 4;
+        while (cursor < source.length) {
+            if (/\s/.test(source[cursor])) {
+                cursor += 1;
+                continue;
+            }
+            if (source.startsWith('//', cursor) || source.startsWith('/*', cursor)) {
+                const comment = skipComment(cursor);
+                if (comment.unsafe) return comment;
+                cursor = comment.index;
+                continue;
+            }
+            break;
+        }
+        if (source[cursor] !== '"' && source[cursor] !== "'") {
+            return unsafe('@use does not use a supported quoted module URL');
+        }
+        const moduleUrl = skipQuoted(cursor, true);
+        if (moduleUrl.unsafe) return moduleUrl;
+        specifiers.push(moduleUrl.value);
+
+        cursor = moduleUrl.index;
+        let terminated = false;
+        while (cursor < source.length) {
+            if (source.startsWith('//', cursor) || source.startsWith('/*', cursor)) {
+                const comment = skipComment(cursor);
+                if (comment.unsafe) return comment;
+                cursor = comment.index;
+                continue;
+            }
+            if (source[cursor] === '"' || source[cursor] === "'") {
+                const quoted = skipQuoted(cursor);
+                if (quoted.unsafe) return quoted;
+                cursor = quoted.index;
+                continue;
+            }
+            if (source[cursor] === '{' || source[cursor] === '}') {
+                return unsafe('unterminated or unsupported @use statement');
+            }
+            if (source[cursor] === ';') {
+                terminated = true;
+                cursor += 1;
+                break;
+            }
+            cursor += 1;
+        }
+        if (!terminated) return unsafe('unterminated @use statement');
+        index = cursor;
+    }
+
+    return braceDepth === 0 ? {
+        unsafe: false,
+        reason: null,
+        specifiers
+    } : unsafe('unterminated brace block');
+}
+
+function inspectCommonUsePublication(scssRoot, targetPath) {
+    const commonPath = path.join(scssRoot, 'common.scss');
+    const publication = {
+        status: 'COMMON_ENTRY_MISSING',
+        strategy: 'common-use',
+        indexPath: commonPath,
+        targetPath,
+        requiredForward: FIGMA_REQUIRED_USE,
+        matchedSpecifiers: [],
+        error: null
+    };
+
+    let stat;
+    try {
+        stat = fs.lstatSync(commonPath);
+    } catch (error) {
+        if (error.code === 'ENOENT') return publication;
+        return { ...publication, status: 'COMMON_ENTRY_UNREADABLE', error: error.message };
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()) return {
+        ...publication,
+        status: 'COMMON_ENTRY_UNSAFE',
+        error: stat.isSymbolicLink() ? 'common.scss is a symbolic link' : 'common.scss is not a regular file'
+    };
+
+    let content;
+    try {
+        const bytes = fs.readFileSync(commonPath);
+        content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch (error) {
+        return { ...publication, status: 'COMMON_ENTRY_UNREADABLE', error: error.message };
+    }
+
+    const scan = scanTopLevelUseSpecifiers(content);
+    if (scan.unsafe) return {
+        ...publication,
+        status: 'COMMON_ENTRY_PARSE_UNSAFE',
+        error: scan.reason
+    };
+
+    const componentRoot = path.resolve(scssRoot, 'Component');
+    const componentSpecifiers = scan.specifiers.filter(specifier => {
+        const resolved = resolveScssModuleTarget(commonPath, specifier);
+        const relative = path.relative(componentRoot, resolved);
+        return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+    });
+    const matches = componentSpecifiers.filter(
+        specifier => resolveScssModuleTarget(commonPath, specifier) === path.resolve(targetPath)
+    );
+    if (matches.length > 0) return {
+        ...publication,
+        status: matches.length === 1 ? 'USE_PRESENT' : 'USE_DUPLICATE',
+        matchedSpecifiers: matches
+    };
+    if (componentSpecifiers.length === 0) return {
+        ...publication,
+        status: 'COMMON_DIRECT_USE_UNCONFIRMED',
+        error: 'common.scss does not contain a top-level @use for the Component directory'
+    };
+    return {
+        ...publication,
+        status: 'USE_MISSING'
+    };
+}
+
 function inspectPublication(scssRoot, targetPath) {
     const indexPath = path.join(scssRoot, 'Component', '_Component.scss');
     const publication = {
         status: 'COMPONENT_INDEX_MISSING',
+        strategy: 'component-forward',
         indexPath,
         targetPath,
         requiredForward: FIGMA_REQUIRED_FORWARD,
@@ -213,7 +418,7 @@ function inspectPublication(scssRoot, targetPath) {
     try {
         fs.lstatSync(indexPath);
     } catch (error) {
-        if (error.code === 'ENOENT') return publication;
+        if (error.code === 'ENOENT') return inspectCommonUsePublication(scssRoot, targetPath);
         return {
             ...publication,
             status: 'COMPONENT_INDEX_UNREADABLE',
