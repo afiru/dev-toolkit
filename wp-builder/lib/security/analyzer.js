@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { normalizePhpRuntimeContract } from './php-runtime-contract.js';
@@ -13,6 +14,17 @@ const ESCAPE_FUNCTIONS = new Set([
 ]);
 const URL_ATTRIBUTES = new Set(['href', 'src', 'action', 'formaction', 'poster', 'cite']);
 const IGNORED_TOKEN_TYPES = new Set(['T_WHITESPACE', 'T_COMMENT', 'T_DOC_COMMENT']);
+const REVIEW_DISPOSITIONS = Object.freeze({
+    CANDIDATES: 'CANDIDATES',
+    MANUAL_ONLY: 'MANUAL_ONLY',
+    NO_CHANGE: 'NO_CHANGE'
+});
+const INDIRECT_CONTROL_FLOW_TOKENS = new Set([
+    'T_IF', 'T_ELSEIF', 'T_ELSE', 'T_SWITCH', 'T_CASE', 'T_DEFAULT',
+    'T_FOR', 'T_FOREACH', 'T_WHILE', 'T_DO', 'T_FUNCTION', 'T_FN',
+    'T_TRY', 'T_CATCH', 'T_FINALLY', 'T_MATCH', 'T_GOTO', 'T_GLOBAL',
+    'T_RETURN', 'T_YIELD', 'T_YIELD_FROM'
+]);
 
 function isIgnoredToken(token) {
     return IGNORED_TOKEN_TYPES.has(token?.type);
@@ -283,6 +295,244 @@ function diagnosticReason(tokens, callStartIndex, callEndIndex) {
     return 'The SCF call is not an eligible standalone direct-output expression.';
 }
 
+function sha256(value) {
+    return createHash('sha256').update(value).digest('hex');
+}
+
+function manualReview(reason) {
+    return {
+        reviewDisposition: REVIEW_DISPOSITIONS.MANUAL_ONLY,
+        reviewReason: reason,
+        reviewCandidates: []
+    };
+}
+
+function candidateReview({ label, confidence, reason, edits }) {
+    return {
+        reviewDisposition: REVIEW_DISPOSITIONS.CANDIDATES,
+        reviewReason: reason,
+        reviewCandidates: [{ label, confidence, recommended: true, reason, edits }]
+    };
+}
+
+function directEscapeWrapper(tokens, pairs, callStartIndex, callEndIndex) {
+    let match = null;
+    for (const [openIndex, closeIndex] of pairs.entries()) {
+        if (openIndex >= callStartIndex || closeIndex <= callEndIndex || tokens[openIndex]?.text !== '(') continue;
+        const functionIndex = previousSignificant(tokens, openIndex);
+        if (functionIndex < 0) continue;
+        const functionName = normalizeFunctionName(tokens[functionIndex].text).toLowerCase();
+        if (!ESCAPE_FUNCTIONS.has(functionName) ||
+            nextSignificant(tokens, openIndex) !== callStartIndex ||
+            previousSignificant(tokens, closeIndex) !== callEndIndex) continue;
+        if (!match || closeIndex - openIndex < match.closeIndex - match.openIndex) {
+            match = { openIndex, closeIndex, functionIndex, functionName };
+        }
+    }
+    if (!match) return null;
+    const directOutput = classifyDirectOutput(tokens, match.functionIndex, match.closeIndex);
+    if (!directOutput.direct) return { ...match, direct: false, outputContext: null };
+    return {
+        ...match,
+        direct: true,
+        outputContext: determineHtmlContext(tokens, directOutput.island.openIndex, directOutput.island.closeIndex)
+    };
+}
+
+function initialDiagnosticReview({
+    finding,
+    tokens,
+    pairs,
+    classIndex,
+    closeParenIndex,
+    significantArguments,
+    directOutput
+}) {
+    if (finding.ruleId === 'WPB-SCF-EXPRESSION-COMPLEX') {
+        if (!directOutput.direct || !finding.outputContext.proposedEscape) {
+            return manualReview('A multiline expression requires manual review because its output context is not safely known.');
+        }
+        const replacement = `${finding.outputContext.proposedEscape}(${finding.exactSourceExpression})`;
+        return candidateReview({
+            label: `Wrap with ${finding.outputContext.proposedEscape}()`,
+            confidence: 'HIGH',
+            reason: `The complete direct-output expression can be wrapped for ${finding.outputContext.kind}.`,
+            edits: [{ ...finding.range, replacement }]
+        });
+    }
+
+    if (finding.ruleId === 'WPB-SCF-ARGUMENT-UNSUPPORTED') {
+        const reviewableDynamicArgument = significantArguments.length === 1 &&
+            significantArguments[0].type === 'T_VARIABLE';
+        if (!directOutput.direct || !finding.outputContext.proposedEscape || !reviewableDynamicArgument) {
+            return manualReview('The SCF argument or output context cannot be reduced to a safe scalar review candidate.');
+        }
+        const replacement = `${finding.outputContext.proposedEscape}(${finding.exactSourceExpression})`;
+        return candidateReview({
+            label: `Review ${finding.outputContext.proposedEscape}() wrapper`,
+            confidence: 'MEDIUM',
+            reason: 'The direct-output context is known; confirm that the dynamic SCF field resolves to a scalar value.',
+            edits: [{ ...finding.range, replacement }]
+        });
+    }
+
+    if (finding.ruleId === 'WPB-SCF-ALREADY-ESCAPED') {
+        const wrapper = directEscapeWrapper(tokens, pairs, classIndex, closeParenIndex);
+        if (!wrapper?.direct || !wrapper.outputContext?.proposedEscape || wrapper.functionName === 'wp_kses_post') {
+            return manualReview('The existing escape wrapper cannot be proven to be a complete context-compatible direct output.');
+        }
+        if (wrapper.functionName === wrapper.outputContext.proposedEscape) {
+            return {
+                reviewDisposition: REVIEW_DISPOSITIONS.NO_CHANGE,
+                reviewReason: `The direct ${wrapper.outputContext.kind} output already uses ${wrapper.functionName}().`,
+                reviewCandidates: []
+            };
+        }
+        const functionToken = tokens[wrapper.functionIndex];
+        const replacement = functionToken.text.startsWith('\\')
+            ? `\\${wrapper.outputContext.proposedEscape}`
+            : wrapper.outputContext.proposedEscape;
+        return candidateReview({
+            label: `Replace ${wrapper.functionName}() with ${wrapper.outputContext.proposedEscape}()`,
+            confidence: 'HIGH',
+            reason: `The existing wrapper does not match the proven ${wrapper.outputContext.kind} context.`,
+            edits: [{ startByte: functionToken.startByte, endByte: functionToken.endByte, replacement }]
+        });
+    }
+
+    return manualReview(finding.reason);
+}
+
+function isVariableVariable(tokens, index) {
+    const before = previousSignificant(tokens, index);
+    return tokens[before]?.text === '$' || tokens[before]?.type === 'T_DOLLAR_OPEN_CURLY_BRACES';
+}
+
+function indirectDiagnosticReview({ finding, tokens, classIndex, closeParenIndex }) {
+    const assignmentOperatorIndex = previousSignificant(tokens, classIndex);
+    const variableIndex = previousSignificant(tokens, assignmentOperatorIndex);
+    const statementEndIndex = nextSignificant(tokens, closeParenIndex);
+    if (tokens[assignmentOperatorIndex]?.text !== '=' ||
+        tokens[variableIndex]?.type !== 'T_VARIABLE' ||
+        tokens[statementEndIndex]?.text !== ';' ||
+        nextSignificant(tokens, variableIndex) !== assignmentOperatorIndex ||
+        isVariableVariable(tokens, variableIndex)) {
+        return manualReview('Phase D1 only follows a simple single-variable assignment.');
+    }
+
+    const boundaryIndex = previousSignificant(tokens, variableIndex);
+    if (boundaryIndex >= 0 &&
+        ![';', '{'].includes(tokens[boundaryIndex].text) &&
+        !['T_OPEN_TAG', 'T_OPEN_TAG_WITH_ECHO'].includes(tokens[boundaryIndex].type)) {
+        return manualReview('The SCF assignment is not a standalone straight-line statement.');
+    }
+
+    const variableName = tokens[variableIndex].text;
+    const occurrences = tokens
+        .map((token, index) => ({ token, index }))
+        .filter(item => item.token.type === 'T_VARIABLE' && item.token.text === variableName);
+    if (occurrences.length !== 2 || occurrences[0].index !== variableIndex) {
+        return manualReview('The assigned variable does not have exactly one definition and one later use.');
+    }
+    const sinkIndex = occurrences[1].index;
+    if (sinkIndex <= statementEndIndex || isVariableVariable(tokens, sinkIndex)) {
+        return manualReview('The assigned variable use cannot be proven to be a later direct sink.');
+    }
+
+    const intervening = tokens.slice(statementEndIndex + 1, sinkIndex);
+    if (intervening.some(token =>
+        INDIRECT_CONTROL_FLOW_TOKENS.has(token.type) ||
+        ['{', '}', '&'].includes(token.text) ||
+        (token.type === 'T_STRING' && token.text.toLowerCase() === 'extract')
+    )) {
+        return manualReview('Control flow, scope changes, references, or dynamic symbol extraction prevent strict tracking.');
+    }
+
+    const sinkOutput = classifyDirectOutput(tokens, sinkIndex, sinkIndex);
+    if (!sinkOutput.direct) {
+        return manualReview('The only tracked variable use is not a standalone direct-output sink.');
+    }
+    const outputContext = determineHtmlContext(tokens, sinkOutput.island.openIndex, sinkOutput.island.closeIndex);
+    if (!outputContext.proposedEscape) {
+        return manualReview('The tracked direct-output sink does not have a supported HTML context.');
+    }
+    const variableToken = tokens[sinkIndex];
+    return candidateReview({
+        label: `Escape ${variableName} at its only output sink`,
+        confidence: 'MEDIUM',
+        reason: `A single straight-line definition reaches one ${outputContext.kind} sink with no other observed use.`,
+        edits: [{
+            startByte: variableToken.startByte,
+            endByte: variableToken.endByte,
+            replacement: `${outputContext.proposedEscape}(${variableName})`
+        }]
+    });
+}
+
+function applyCandidateEdits(bytes, edits) {
+    let desired = Buffer.from(bytes);
+    for (const edit of [...edits].sort((left, right) => right.startByte - left.startByte)) {
+        desired = Buffer.concat([
+            desired.subarray(0, edit.startByte),
+            Buffer.from(edit.replacement, 'utf8'),
+            desired.subarray(edit.endByte)
+        ]);
+    }
+    return desired;
+}
+
+function finalizeDiagnosticReview(finding, bytes, phpCommand) {
+    if (finding.reviewDisposition !== REVIEW_DISPOSITIONS.CANDIDATES) return finding;
+    const candidates = [];
+    for (let index = 0; index < finding.reviewCandidates.length; index += 1) {
+        const draft = finding.reviewCandidates[index];
+        const edits = [...draft.edits].sort((left, right) => left.startByte - right.startByte);
+        const invalid = edits.some((edit, editIndex) =>
+            !Number.isSafeInteger(edit.startByte) || !Number.isSafeInteger(edit.endByte) ||
+            edit.startByte < 0 || edit.endByte <= edit.startByte || edit.endByte > bytes.length ||
+            (editIndex > 0 && edit.startByte < edits[editIndex - 1].endByte)
+        );
+        if (invalid) continue;
+        const desired = applyCandidateEdits(bytes, edits);
+        const lintResult = spawnSync(phpCommand ?? 'php', ['-l'], {
+            input: desired,
+            encoding: 'utf8',
+            maxBuffer: 16 * 1024 * 1024,
+            windowsHide: true
+        });
+        const lint = {
+            available: lintResult.error?.code !== 'ENOENT',
+            passed: !lintResult.error && lintResult.status === 0,
+            exitCode: lintResult.error ? null : lintResult.status
+        };
+        if (!lint.available || !lint.passed) continue;
+        candidates.push({
+            schemaVersion: 1,
+            candidateId: `${finding.id}-candidate-${String(index + 1).padStart(2, '0')}`,
+            findingId: finding.id,
+            label: draft.label,
+            confidence: draft.confidence,
+            recommended: draft.recommended,
+            reason: draft.reason,
+            edits: edits.map(edit => ({
+                startByte: edit.startByte,
+                endByte: edit.endByte,
+                originalSha256: sha256(bytes.subarray(edit.startByte, edit.endByte)),
+                replacement: edit.replacement
+            })),
+            desiredSha256: sha256(desired),
+            lint
+        });
+    }
+    if (candidates.length === 0) return {
+        ...finding,
+        reviewDisposition: REVIEW_DISPOSITIONS.MANUAL_ONLY,
+        reviewReason: 'No candidate passed fixed-range validation and PHP lint.',
+        reviewCandidates: []
+    };
+    return { ...finding, reviewCandidates: candidates, reviewSourceSha256: sha256(bytes) };
+}
+
 function parseTokenizerOutput(result) {
     if (result.error?.code === 'ENOENT') return {
         ok: false,
@@ -359,12 +609,15 @@ function makeParseUnsafeFinding(filePath, bytes, tokenizerResult) {
         proposedEscape: null,
         confidence: 'LOW',
         autoFixable: false,
+        reviewDisposition: REVIEW_DISPOSITIONS.MANUAL_ONLY,
+        reviewReason: 'Parsing must succeed before any diagnostic candidate can be generated.',
+        reviewCandidates: [],
         reason: `${tokenizerResult.message}${runtimeNote}`,
         replacement: null
     };
 }
 
-export function analyzeSecurityFile({ filePath, bytes, phpCommand, tokenizerPath } = {}) {
+export function analyzeSecurityFile({ filePath, bytes, phpCommand, tokenizerPath, candidateLintPhpCommand } = {}) {
     const tokenizer = runPhpTokenizer(bytes, { phpCommand, tokenizerPath });
     if (!tokenizer.ok) return {
         tokenizer: {
@@ -382,6 +635,7 @@ export function analyzeSecurityFile({ filePath, bytes, phpCommand, tokenizerPath
     const delimiterPairs = buildDelimiterPairs(tokens);
     const hasNamespace = tokens.some(token => token.type === 'T_NAMESPACE');
     const findings = [];
+    const findingInternals = [];
 
     for (let classIndex = 0; classIndex < tokens.length; classIndex += 1) {
         const classToken = tokens[classIndex];
@@ -461,7 +715,7 @@ export function analyzeSecurityFile({ filePath, bytes, phpCommand, tokenizerPath
 
         const proposedEscape = autoFixable ? outputContext.proposedEscape : null;
         const replacementText = proposedEscape ? `${proposedEscape}(${exactSourceExpression})` : null;
-        findings.push({
+        const finding = {
             id: `finding-${String(findings.length + 1).padStart(4, '0')}`,
             file: filePath,
             range: { startByte, endByte },
@@ -485,8 +739,38 @@ export function analyzeSecurityFile({ filePath, bytes, phpCommand, tokenizerPath
                 endByte,
                 replacementText
             } : null
-        });
+        };
+        if (!autoFixable) {
+            Object.assign(finding, initialDiagnosticReview({
+                finding,
+                tokens,
+                pairs: delimiterPairs,
+                classIndex,
+                closeParenIndex,
+                significantArguments,
+                directOutput
+            }));
+        }
+        findings.push(finding);
+        findingInternals.push({ classIndex, closeParenIndex });
         classIndex = closeParenIndex;
+    }
+
+    for (let index = 0; index < findings.length; index += 1) {
+        if (findings[index].ruleId === 'WPB-SCF-INDIRECT-USAGE') {
+            Object.assign(findings[index], indirectDiagnosticReview({
+                finding: findings[index],
+                tokens,
+                ...findingInternals[index]
+            }));
+        }
+        if (!findings[index].autoFixable) {
+            findings[index] = finalizeDiagnosticReview(
+                findings[index],
+                bytes,
+                candidateLintPhpCommand ?? phpCommand
+            );
+        }
     }
 
     return {
@@ -504,5 +788,6 @@ export function analyzeSecurityFile({ filePath, bytes, phpCommand, tokenizerPath
 
 export const securityAnalyzerInternals = Object.freeze({
     tokenizerPath: path.resolve(TOKENIZER_PATH),
-    urlAttributes: URL_ATTRIBUTES
+    urlAttributes: URL_ATTRIBUTES,
+    reviewDispositions: REVIEW_DISPOSITIONS
 });

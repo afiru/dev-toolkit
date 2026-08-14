@@ -9,6 +9,7 @@ export function runCli(cwd, args, options = {}) {
     return spawnSync(process.execPath, [cliPath, ...args], {
         cwd,
         encoding: 'utf8',
+        env: options.env,
         input: options.input,
         windowsHide: true
     });

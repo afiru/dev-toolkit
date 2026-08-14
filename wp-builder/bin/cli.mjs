@@ -28,6 +28,20 @@ import {
     renderSecurityFixPreview
 } from '../lib/security/fix-preview.js';
 import {
+    openSecurityFixDiff,
+    securityFixPreviewBlockingReasons
+} from '../lib/security/fix-diff.js';
+import {
+    buildSecurityFixDirectoryPlan,
+    openSecurityFixDirectoryDiffs,
+    renderSecurityFixDirectoryEditSelection,
+    renderSecurityFixDirectoryPreview
+} from '../lib/security/fix-directory.js';
+import {
+    openSecurityFixEdit,
+    openSecurityFixEditReview
+} from '../lib/security/fix-edit.js';
+import {
     applySecurityFixPlan
 } from '../lib/security/fix-apply.js';
 import {
@@ -148,8 +162,11 @@ program.command('security').option('--fix').action((opt) => runSecurityScan(opt)
 
 program
     .command('security:fix')
-    .description('Preview or apply a safe single-file Security Fix Plan')
-    .requiredOption('--file <path>', 'One PHP file inside the current workspace')
+    .description('Preview safe Security Fix Plans or apply one file')
+    .option('--file <path>', 'One PHP file inside the current workspace')
+    .option('--dir <path>', 'Recursively preview PHP files inside one workspace directory')
+    .option('--diff', 'Open the linted Security Fix candidate in a read-only VS Code diff')
+    .option('--edit', 'Apply verified candidates to a dirty VS Code editor without saving')
     .option('--apply', 'Apply the previewed Security Fix Plan')
     .option('--yes', 'Skip interactive confirmation (requires --apply)')
     .addHelpText('after', `
@@ -161,6 +178,26 @@ Support:
   Legacy "security --fix": DISABLE_CANDIDATE; migrate to "security:fix --file <path>".
 `)
     .action(async (options) => {
+        if (Boolean(options.file) === Boolean(options.dir)) {
+            console.error('[ERROR] Specify exactly one of --file or --dir.');
+            process.exitCode = 1;
+            return;
+        }
+        if (options.dir && options.apply) {
+            console.error('[ERROR] Directory apply is unsupported. Use --dir for preview or --dir --diff.');
+            process.exitCode = 1;
+            return;
+        }
+        if (options.edit && (options.apply || options.diff)) {
+            console.error('[ERROR] --edit cannot be combined with --apply or --diff.');
+            process.exitCode = 1;
+            return;
+        }
+        if (options.diff && options.apply) {
+            console.error('[ERROR] --diff cannot be combined with --apply.');
+            process.exitCode = 1;
+            return;
+        }
         if (options.yes && !options.apply) {
             console.error('[ERROR] --yes requires --apply.');
             process.exitCode = 1;
@@ -170,6 +207,27 @@ Support:
         const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
 
         try {
+            if (options.dir) {
+                const directoryPlan = buildSecurityFixDirectoryPlan({
+                    workspaceRoot,
+                    directory: options.dir
+                });
+                renderSecurityFixDirectoryPreview(directoryPlan);
+                if (!directoryPlan.canOpenDiffs) {
+                    process.exitCode = 2;
+                    return;
+                }
+                if (options.diff) openSecurityFixDirectoryDiffs(directoryPlan);
+                if (options.edit) {
+                    const result = openSecurityFixEditReview(directoryPlan);
+                    if (result.status !== 'session-started') {
+                        renderSecurityFixDirectoryEditSelection(directoryPlan);
+                        process.exitCode = 1;
+                    }
+                }
+                return;
+            }
+
             const plan = buildSecurityFixPlan({
                 workspaceRoot,
                 file: options.file
@@ -177,6 +235,34 @@ Support:
             renderSecurityFixPreview(plan, {
                 applyRequested: options.apply
             });
+
+            if (options.diff) {
+                const diffBlockingReasons = securityFixPreviewBlockingReasons(plan);
+                if (diffBlockingReasons.length > 0) {
+                    console.error('Security Fix diff is blocked by the diagnostics above.');
+                    process.exitCode = 2;
+                    return;
+                }
+                const result = openSecurityFixDiff(plan);
+                if (result.status === 'lint-blocked') process.exitCode = 2;
+                return;
+            }
+
+            if (options.edit) {
+                const editBlockingReasons = securityFixPreviewBlockingReasons(plan);
+                if (editBlockingReasons.length > 0) {
+                    console.error('Security Fix edit is blocked by the diagnostics above.');
+                    process.exitCode = 2;
+                    return;
+                }
+                if (plan.counts.autoFixable === 0) {
+                    openSecurityFixDiff(plan);
+                    return;
+                }
+                const result = openSecurityFixEdit(plan, { workspaceRoot });
+                if (result.status !== 'request-sent') process.exitCode = 1;
+                return;
+            }
 
             if (!plan.canApply) {
                 const windowsApplyUnsupported = plan.blockingReasons.some(

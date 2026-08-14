@@ -447,7 +447,8 @@ export function buildSecurityFixPlan({
         filePath: targetPath,
         bytes: snapshot.bytes,
         phpCommand: tokenizerPhpCommand,
-        tokenizerPath
+        tokenizerPath,
+        candidateLintPhpCommand: lintPhpCommand
     });
     const replacements = analysis.findings
         .filter(finding => finding.autoFixable && finding.replacement)

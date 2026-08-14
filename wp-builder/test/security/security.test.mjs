@@ -1,9 +1,14 @@
 await import('./analyzer.test.mjs');
+await import('./diagnostic-review.test.mjs');
 await import('./linux-metadata.test.mjs');
 await import('./linux-descriptor-snapshot.test.mjs');
 await import('./html-context.test.mjs');
 await import('./byte-preservation.test.mjs');
 await import('./fix-plan.test.mjs');
+await import('./fix-diff.test.mjs');
+await import('./fix-directory.test.mjs');
+await import('./fix-edit.test.mjs');
+await import('./vscode-edit-extension.test.mjs');
 await import('./fix-apply.test.mjs');
 await import('./linux-rollback.test.mjs');
 await import('./cli.test.mjs');
