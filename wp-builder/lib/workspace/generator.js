@@ -12,7 +12,7 @@ const {
     scssRoot
 } = getProjectContext();
 
-function scssStub(name) {
+function scssStub() {
     return `/* ==========================================================================
    use＆nameSpace
    ========================================================================== */
@@ -21,10 +21,40 @@ function scssStub(name) {
 /* ==========================================================================
    LAYOUT
    ========================================================================== */
-
-.${name} {
-}
 `;
+}
+
+function stripScssComments(source) {
+    return source
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/.*$/gm, '');
+}
+
+function hasActiveUse(source, specifier) {
+    const activeSource = stripScssComments(source);
+    const usePattern = /^\s*@use\s+(['"])([^'"]+)\1(?:\s+[^;]+)?\s*;/gm;
+    let match;
+    while ((match = usePattern.exec(activeSource)) !== null) {
+        if (match[2] === specifier) return true;
+    }
+    return false;
+}
+
+function ensureCommonLayoutUse(layoutParts) {
+    if (layoutParts.length === 0) return;
+
+    const indexName = layoutParts.at(-1);
+    const specifier = `Layout/${layoutParts.join('/')}/${indexName}`;
+    const line = `@use "${specifier}";`;
+    const commonPath = path.join(scssRoot, 'common.scss');
+    const current = fs.existsSync(commonPath) ? fs.readFileSync(commonPath, 'utf8') : '';
+
+    if (hasActiveUse(current, specifier)) return;
+
+    fs.mkdirSync(path.dirname(commonPath), { recursive: true });
+    const separator = current.length > 0 && !current.endsWith('\n') ? '\n' : '';
+    fs.appendFileSync(commonPath, `${separator}${line}\n`, 'utf8');
+    console.log(`Updated Common: ${commonPath}`);
 }
 
 export function ensureTemplateFiles(templatePart) {
@@ -58,7 +88,7 @@ export function ensureTemplateFiles(templatePart) {
         fs.mkdirSync(path.dirname(scssP), {
             recursive: true
         });
-        fs.writeFileSync(scssP, scssStub(fileName), 'utf8');
+        fs.writeFileSync(scssP, scssStub(), 'utf8');
         console.log(`Created SCSS: ${scssP}`);
     }
 
@@ -71,4 +101,7 @@ export function ensureTemplateFiles(templatePart) {
         fs.appendFileSync(idx, `${line}\n`);
         console.log(`Updated Index: ${idx}`);
     }
+
+    // 4. common.scssへLayout indexを登録
+    ensureCommonLayoutUse(parts);
 }

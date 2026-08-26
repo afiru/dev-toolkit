@@ -166,7 +166,7 @@ export function scanScssFile(f) {
             }
             continue;
         }
-        ensureFile(target, `.${path.basename(target, '.scss').slice(1)} {\n}\n`);
+        ensureFile(target, '');
     }
 }
 
